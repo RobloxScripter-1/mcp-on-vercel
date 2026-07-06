@@ -34,13 +34,23 @@ function secretsMatch(a: string, b: string): boolean {
   return diff === 0;
 }
 
-async function forwardToGitHub(body: unknown): Promise<Response> {
+async function forwardToGitHub(body: unknown, incoming: Headers): Promise<Response> {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    Authorization: `Bearer ${GITHUB_PAT}`,
+  };
+
+  // Streamable HTTP servers care about Accept (often needs to include
+  // text/event-stream) and about the session id once one's been issued.
+  const accept = incoming.get('accept');
+  if (accept) headers['Accept'] = accept;
+
+  const sessionId = incoming.get('mcp-session-id');
+  if (sessionId) headers['Mcp-Session-Id'] = sessionId;
+
   return fetch(GITHUB_MCP_URL, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${GITHUB_PAT}`,
-    },
+    headers,
     body: JSON.stringify(body),
   });
 }
@@ -64,14 +74,21 @@ async function handleRequest(req: Request): Promise<Response> {
     return new Response('Invalid JSON', { status: 400 });
   }
 
-  const upstream = await forwardToGitHub(body);
-  const text = await upstream.text();
+  const upstream = await forwardToGitHub(body, req.headers);
 
-  return new Response(text, {
+  // Stream the body through untouched rather than buffering with .text() —
+  // GitHub's MCP server can reply with text/event-stream (SSE), and
+  // buffering breaks that.
+  const headers = new Headers();
+  upstream.headers.forEach((value, key) => {
+    if (!['content-encoding', 'content-length', 'connection'].includes(key.toLowerCase())) {
+      headers.set(key, value);
+    }
+  });
+
+  return new Response(upstream.body, {
     status: upstream.status,
-    headers: {
-      'Content-Type': upstream.headers.get('Content-Type') ?? 'application/json',
-    },
+    headers,
   });
 }
 
