@@ -1,6 +1,6 @@
 // api/server.ts
 //
-// A real MCP server (not a raw proxy) built with @vercel/mcp-adapter's
+// A real MCP server (not a raw proxy) built with mcp-handler's
 // createMcpHandler. Each tool below calls GitHub's REST API directly
 // using a server-side Personal Access Token (PAT) — Claude never sees
 // the token, only the tool results.
@@ -105,7 +105,6 @@ const mcpHandler = createMcpHandler((server) => {
       branch: z.string().optional().describe('Branch to commit to, defaults to repo default branch'),
     },
     async ({ owner, repo, path, content, message, branch }) => {
-      // Need the current file's sha if it exists, to update rather than create.
       let sha: string | undefined;
       try {
         const existing: any = await githubRequest(
@@ -353,6 +352,46 @@ const mcpHandler = createMcpHandler((server) => {
       const q = encodeURIComponent(`${query} repo:${owner}/${repo}`);
       const data = await githubRequest(`/search/code?q=${q}`);
       return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+    }
+  );
+
+  server.tool(
+    'delete_branch',
+    'Delete a branch from a GitHub repo',
+    {
+      owner: z.string(),
+      repo: z.string(),
+      branch: z.string().describe('Name of the branch to delete'),
+    },
+    async ({ owner, repo, branch }) => {
+      await githubRequest(`/repos/${owner}/${repo}/git/refs/heads/${branch}`, {
+        method: 'DELETE',
+      });
+      return { content: [{ type: 'text', text: `Branch "${branch}" deleted.` }] };
+    }
+  );
+
+  server.tool(
+    'delete_repo',
+    'PERMANENTLY delete a GitHub repository. This cannot be undone — all code, issues, PRs, and history are lost. Requires the repo name to be passed exactly as confirmation.',
+    {
+      owner: z.string(),
+      repo: z.string(),
+      confirm_repo_name: z.string().describe('Must exactly match the repo name, as a safety confirmation'),
+    },
+    async ({ owner, repo, confirm_repo_name }) => {
+      if (confirm_repo_name !== repo) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Confirmation mismatch: "${confirm_repo_name}" does not match "${repo}". Repo NOT deleted.`,
+            },
+          ],
+        };
+      }
+      await githubRequest(`/repos/${owner}/${repo}`, { method: 'DELETE' });
+      return { content: [{ type: 'text', text: `Repository "${owner}/${repo}" has been permanently deleted.` }] };
     }
   );
 });
