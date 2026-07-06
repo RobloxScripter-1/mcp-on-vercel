@@ -1,6 +1,6 @@
 // api/server.ts
 //
-// A real MCP server (not a raw proxy) built with @vercel/mcp-adapter's
+// A real MCP server (not a raw proxy) built with mcp-handler's
 // createMcpHandler. Each tool below calls GitHub's REST API directly
 // using a server-side Personal Access Token (PAT) — Claude never sees
 // the token, only the tool results.
@@ -18,9 +18,9 @@
 // Claude web custom connector URL:
 //   https://<your-project>.vercel.app/mcp?key=<PROXY_SECRET>
 //
-// package.json needs: @vercel/mcp-adapter, zod
+// package.json needs: mcp-handler, @modelcontextprotocol/sdk (>=1.26.0), zod
 
-import { createMcpHandler } from '@vercel/mcp-adapter';
+import { createMcpHandler } from 'mcp-handler';
 import { z } from 'zod';
 
 const GITHUB_PAT = process.env.GITHUB_PAT!;
@@ -105,7 +105,6 @@ const mcpHandler = createMcpHandler((server) => {
       branch: z.string().optional().describe('Branch to commit to, defaults to repo default branch'),
     },
     async ({ owner, repo, path, content, message, branch }) => {
-      // Need the current file's sha if it exists, to update rather than create.
       let sha: string | undefined;
       try {
         const existing: any = await githubRequest(
@@ -168,8 +167,6 @@ const mcpHandler = createMcpHandler((server) => {
   );
 });
 
-// Wrap the MCP handler with the shared-secret check before it ever
-// reaches createMcpHandler's protocol logic.
 async function handler(req: Request): Promise<Response> {
   const url = new URL(req.url);
   const providedKey = url.searchParams.get('key');
@@ -182,4 +179,3 @@ async function handler(req: Request): Promise<Response> {
 }
 
 export { handler as GET, handler as POST, handler as DELETE };
-    
