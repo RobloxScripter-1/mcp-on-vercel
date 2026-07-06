@@ -1,3 +1,4 @@
+
 {
   "name": "mcp-on-vercel",
   "version": "1.0.0",
@@ -13,6 +14,7 @@
   "packageManager": "pnpm@9.4.0",
   "dependencies": {
     "mcp-handler": "^1.0.1",
+    "@modelcontextprotocol/sdk": "^1.26.0",
     "zod": "^3.24.2"
   },
   "devDependencies": {
