@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from 'node:crypto';
 
-const BASE_URL = (process.env.MCP_PUBLIC_BASE_URL || 'https://mcp-on-vercel.vercel.app').replace(/\/+$/, '');
+const BASE_URL = (process.env.MCP_PUBLIC_BASE_URL || 'https://mcp-on-vercel-msaiful0404-5024s-projects.vercel.app').replace(/\/+$/, '');
 const RESOURCE = process.env.MCP_RESOURCE_URL || `${BASE_URL}/mcp`;
 const GITHUB_CALLBACK = `${BASE_URL}/oauth/github/callback`;
 const TTL = { client: 31536000, state: 600, code: 120, access: 3600, refresh: 2592000 };
