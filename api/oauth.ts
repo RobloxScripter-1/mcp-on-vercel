@@ -10,7 +10,7 @@ const traceId=()=>randomBytes(8).toString('hex');
 function safeDiagnosticText(value:unknown){
   let out=String(value??'unknown');
   for(const secret of [process.env.GITHUB_OAUTH_CLIENT_SECRET,process.env.GITHUB_PAT,process.env.PROXY_SECRET,process.env.UPSTASH_REDIS_REST_TOKEN,process.env.UPSTASH_REDIS_REST_URL].filter((v):v is string=>Boolean(v)))out=out.split(secret).join('[redacted]');
-  return out.replace(/Bearer\\s+\\S+/gi,'Bearer [redacted]').replace(/https?:\\/\\/\\S+/gi,'[URL redacted]').slice(0,220);
+  return out.replace(/Bearer\s+\S+/gi,'Bearer [redacted]').replace(/https?:\/\/\S+/gi,'[URL redacted]').slice(0,220);
 }
 function requestInfo(req:Request){
   const u=new URL(req.url),names:string[]=[];
