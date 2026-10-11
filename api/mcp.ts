@@ -1,4 +1,4 @@
-const BASE_URL = (process.env.MCP_PUBLIC_BASE_URL || 'https://mcp-on-vercel.vercel.app').replace(/\/+$/, '');
+const BASE_URL = (process.env.MCP_PUBLIC_BASE_URL || 'https://mcp-on-vercel-msaiful0404-5024s-projects.vercel.app').replace(/\/+$/, '');
 const RESOURCE = process.env.MCP_RESOURCE_URL || `${BASE_URL}/mcp`;
 const METADATA_URL = `${BASE_URL}/.well-known/oauth-protected-resource/mcp`;
 
