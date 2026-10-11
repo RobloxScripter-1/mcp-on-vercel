@@ -4,7 +4,7 @@ const BASE_URL = (process.env.MCP_PUBLIC_BASE_URL || 'https://mcp-on-vercel-msai
 const RESOURCE = process.env.MCP_RESOURCE_URL || `${BASE_URL}/mcp`;
 const GITHUB_CALLBACK = `${BASE_URL}/oauth/github/callback`;
 const TTL = { client: 31536000, state: 600, code: 120, access: 3600, refresh: 2592000 };
-type OAuthState = { client_id:string; redirect_uri:string; state:string; challenge:string; resource:string; scope:string };
+type OAuthState = { client_id:string; redirect_uri:string; state:string; challenge:string; resource:string; scope:string; trace_id?:string };
 const json=(x:unknown,status=200)=>new Response(JSON.stringify(x),{status,headers:{'Content-Type':'application/json','Cache-Control':'no-store'}});
 const traceId=()=>randomBytes(8).toString('hex');
 function safeDiagnosticText(value:unknown){
@@ -15,7 +15,10 @@ function safeDiagnosticText(value:unknown){
 function requestInfo(req:Request){
   const u=new URL(req.url),names:string[]=[];
   u.searchParams.forEach((_v,k)=>{if(!names.includes(k))names.push(k)});
-  return {method:req.method,path:u.pathname,query_parameter_names:names,content_type:req.headers.get('content-type')||null,vercel_request_id:req.headers.get('x-vercel-id')||null};
+  const hostHeader=req.headers.get('host')||null,forwardedHost=req.headers.get('x-forwarded-host')||null;
+  const referer=req.headers.get('referer'),origin=req.headers.get('origin');
+  const safeHost=(value:string|null)=>{if(!value)return null;try{return new URL(value.includes('://')?value:`https://${value}`).host}catch{return value.split(',')[0].trim().slice(0,160)||null}};
+  return {method:req.method,path:u.pathname,query_parameter_names:names,content_type:req.headers.get('content-type')||null,vercel_request_id:req.headers.get('x-vercel-id')||null,request_headers:{host:hostHeader,forwarded_host:forwardedHost,forwarded_proto:req.headers.get('x-forwarded-proto')||null,referer_host:safeHost(referer),origin_host:safeHost(origin),sec_fetch_site:req.headers.get('sec-fetch-site')||null,user_agent:safeDiagnosticText(req.headers.get('user-agent')||'unknown')}};
 }
 function diagnosticSanitize(value:any,key=''):any{
   if(/(^|_)(secret|pat|access_token|refresh_token|authorization_code|github_code|code_verifier|code_challenge|state|password|cookie|authorization|token)$/i.test(key))return '[redacted]';
@@ -86,16 +89,19 @@ const pkceMethodOk=method==='S256',pkceChallengeOk=/^[A-Za-z0-9_-]{43,128}$/.tes
 if(!pkceMethodOk||!pkceChallengeOk)return debug('oauth_pkce_validation_failed',{checks:[{name:'pkce_method_is_s256',ok:pkceMethodOk,result:method||'missing'},{name:'pkce_challenge_format',ok:pkceChallengeOk,details:{present:Boolean(challenge),length:challenge.length}}]},400,req);
 if(resource!==RESOURCE)return debug('oauth_resource_mismatch',{checks:[{name:'resource_matches_server_configuration',ok:false}],resource_parameter_present:Boolean(resource),reconnect_required:true},400,req);
 const githubState=randomBytes(32).toString('base64url');
-const record:OAuthState={client_id:clientId,redirect_uri:redirect,state,challenge,resource,scope:'github'};
+const authTraceId=traceId();
+const stateFingerprint=createHash('sha256').update(githubState).digest('hex').slice(0,12);
+const record:OAuthState={client_id:clientId,redirect_uri:redirect,state,challenge,resource,scope:'github',trace_id:authTraceId};
 try{await put(`mcp_oauth_state:${githubState}`,record,TTL.state)}catch(e){return debug('redis_state_store_failed',{state_fingerprint:createHash('sha256').update(githubState).digest('hex').slice(0,12),state_ttl_seconds:TTL.state,redis:redisDiagnostics(e),checks:[{name:'oauth_state_created',ok:true},{name:'redis_set_state',ok:false}]},500,req)}
-console.info(JSON.stringify({event:'oauth_state_stored',timestamp:new Date().toISOString(),state_fingerprint:createHash('sha256').update(githubState).digest('hex').slice(0,12),state_ttl_seconds:TTL.state}));
+console.info(JSON.stringify({event:'oauth_state_stored',timestamp:new Date().toISOString(),trace_id:authTraceId,state_fingerprint:stateFingerprint,state_ttl_seconds:TTL.state}));
 const gh=new URL('https://github.com/login/oauth/authorize');
 gh.searchParams.set('client_id',process.env.GITHUB_OAUTH_CLIENT_ID!);gh.searchParams.set('redirect_uri',GITHUB_CALLBACK);gh.searchParams.set('scope','read:user');gh.searchParams.set('state',githubState);gh.searchParams.set('allow_signup','false');
+console.info(JSON.stringify({event:'oauth_github_redirect_issued',timestamp:new Date().toISOString(),trace_id:authTraceId,state_fingerprint:stateFingerprint,callback_host:new URL(GITHUB_CALLBACK).host,callback_path:new URL(GITHUB_CALLBACK).pathname,github_authorization_host:gh.host,github_authorization_query_parameter_names:Array.from(gh.searchParams.keys()),redirect_status:302}));
 return Response.redirect(gh.toString(),302)}
 async function githubCallback(req:Request){
 if(!ready())return debug('oauth_environment_incomplete',{checks:[{name:'required_environment',ok:false,details:{missing:missing()}}]},503,req);
 const u=new URL(req.url),state=u.searchParams.get('state')||'';
-if(!state)return debug('oauth_state_parameter_missing',{checks:[{name:'github_state_parameter',ok:false,result:'missing'}],redis_lookup_attempted:false,diagnosis:['The callback URL did not include a state query parameter, so Redis was not queried.'],possible_causes:['The callback URL was opened directly','The state query parameter was lost before reaching this endpoint']},400,req);
+if(!state)return debug('oauth_state_parameter_missing',{checks:[{name:'github_state_parameter',ok:false,result:'missing'}],redis_lookup_attempted:false,callback_expected_host:new URL(GITHUB_CALLBACK).host,callback_expected_path:new URL(GITHUB_CALLBACK).pathname,callback_received_host:u.host,callback_received_path:u.pathname,callback_query_parameter_names:Array.from(u.searchParams.keys()),diagnosis:['The callback request reached the configured route without a state query parameter, so Redis was not queried.'],possible_causes:['The callback URL was opened directly','The browser/client navigated to the callback without GitHub returning code and state','An upstream redirect or client removed the callback query string']},400,req);
 const stateFingerprint=createHash('sha256').update(state).digest('hex').slice(0,12);
 let observed:any;
 try{observed=await takeDetailed(`mcp_oauth_state:${state}`)}catch(e){const command=e instanceof RedisDiagnosticError?e.command:'UNKNOWN';return debug(command==='DEL'?'redis_state_consume_failed':'redis_state_lookup_failed',{state_parameter_present:true,state_length:state.length,state_fingerprint:stateFingerprint,redis_key_prefix:'mcp_oauth_state:',redis:redisDiagnostics(e),exception:e instanceof Error?{name:e.name,message:safeDiagnosticText(e.message)}:{message:'Unknown exception'},checks:[{name:'github_state_parameter',ok:true},{name:command==='DEL'?'redis_delete_state':'redis_get_state',ok:false}]},500,req)}
@@ -103,7 +109,7 @@ if(!observed.observation.key_found)return debug('oauth_state_missing',{state_par
 if(!observed.observation.json_parse_ok)return debug('oauth_state_record_corrupt',{state_fingerprint:stateFingerprint,redis_observation:observed.observation,checks:[{name:'redis_get_state',ok:true},{name:'state_json_parse',ok:false}]},500,req);
 const record=observed.value as OAuthState|null;
 if(!record||typeof record!=='object'||typeof record.client_id!=='string'||typeof record.redirect_uri!=='string'||typeof record.state!=='string'||typeof record.challenge!=='string'||typeof record.resource!=='string')return debug('oauth_state_record_invalid',{state_fingerprint:stateFingerprint,redis_observation:observed.observation,checks:[{name:'state_record_schema',ok:false}]},500,req);
-console.info(JSON.stringify({event:'oauth_state_consumed',timestamp:new Date().toISOString(),state_fingerprint:stateFingerprint,redis_observation:observed.observation}));
+console.info(JSON.stringify({event:'oauth_state_consumed',timestamp:new Date().toISOString(),trace_id:record.trace_id||null,state_fingerprint:stateFingerprint,redis_observation:observed.observation}));
 if(u.searchParams.get('error')){const d=new URL(record.redirect_uri);d.searchParams.set('error','access_denied');d.searchParams.set('state',record.state);return Response.redirect(d.toString(),302)}
 const code=u.searchParams.get('code');
 if(!code)return debug('github_code_missing',{state_fingerprint:stateFingerprint,checks:[{name:'github_state_validation',ok:true},{name:'github_code_parameter',ok:false}]},400,req);
