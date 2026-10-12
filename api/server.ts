@@ -29,7 +29,7 @@ const GITHUB_PAT = process.env.GITHUB_PAT!;
 const PROXY_SECRET = process.env.PROXY_SECRET!;
 const GITHUB_API = 'https://api.github.com';
 
-type ServerTraceContext={trace_id:string;parent_trace_id:string|null};
+type ServerTraceContext={trace_id:string;parent_trace_id:string|null;flow_id:string|null};
 const serverTraceContext=new AsyncLocalStorage<ServerTraceContext>();
 const serverTraceId=()=>randomBytes(8).toString('hex');
 function serverSafeText(value:unknown){
@@ -60,10 +60,11 @@ async function githubRequest(path: string, init: RequestInit = {}) {
   const context=serverTraceContext.getStore();
   const trace=context?.trace_id||'untracked';
   const parentTrace=context?.parent_trace_id||null;
+  const flowId=context?.flow_id||null;
   const method=String(init.method||'GET').toUpperCase();
   const endpoint=new URL(path,GITHUB_API);
   if(!GITHUB_PAT){
-    serverLog('github_api_request_failed',{trace_id:trace,parent_trace_id:parentTrace,stage:'github_pat_missing',method,endpoint_path:endpoint.pathname,checks:[{name:'github_pat_configured',ok:false}]});
+    serverLog('github_api_request_failed',{trace_id:trace,parent_trace_id:parentTrace,flow_id:flowId,stage:'github_pat_missing',method,endpoint_path:endpoint.pathname,checks:[{name:'github_pat_configured',ok:false}]});
     throw new Error('GitHub API request blocked: GITHUB_PAT is not configured.');
   }
   const started=Date.now();
@@ -447,25 +448,27 @@ async function handler(req: Request): Promise<Response> {
   const parentTrace=parentRaw&&/^[a-f0-9]{8,32}$/i.test(parentRaw)?parentRaw:null;
   const started=Date.now();
   const url=new URL(req.url),queryNames:string[]=[];
+  const flowRaw=req.headers.get('x-mcp-flow-id');
+  const flowId=flowRaw&&/^[a-f0-9]{16}$/i.test(flowRaw)?flowRaw:null;
   url.searchParams.forEach((_value,key)=>{if(!queryNames.includes(key))queryNames.push(key)});
   const providedKey=url.searchParams.get('key');
-  serverLog('github_mcp_server_request_started',{trace_id:trace,parent_trace_id:parentTrace,method:req.method,path:url.pathname,query_parameter_names:queryNames,vercel_request_id:req.headers.get('x-vercel-id')||null,proxy_secret_configured:Boolean(PROXY_SECRET),proxy_key_present:Boolean(providedKey),proxy_key_length:providedKey?.length||0,github_pat_configured:Boolean(GITHUB_PAT)});
+  serverLog('github_mcp_server_request_started',{trace_id:trace,parent_trace_id:parentTrace,flow_id:flowId,method:req.method,path:url.pathname,query_parameter_names:queryNames,vercel_request_id:req.headers.get('x-vercel-id')||null,proxy_secret_configured:Boolean(PROXY_SECRET),proxy_key_present:Boolean(providedKey),proxy_key_length:providedKey?.length||0,github_pat_configured:Boolean(GITHUB_PAT)});
   if(!PROXY_SECRET||!providedKey||!secretsMatch(providedKey,PROXY_SECRET)){
     const stage=!PROXY_SECRET?'server_proxy_secret_missing':!providedKey?'server_proxy_key_missing':'server_proxy_key_mismatch';
     const checks=[{name:'proxy_secret_configured',ok:Boolean(PROXY_SECRET)},{name:'proxy_key_parameter_present',ok:Boolean(providedKey)},{name:'proxy_key_matches_configured_secret',ok:Boolean(PROXY_SECRET&&providedKey&&secretsMatch(providedKey,PROXY_SECRET))}];
-    serverLog('github_mcp_server_request_rejected',{trace_id:trace,parent_trace_id:parentTrace,stage,checks});
+    serverLog('github_mcp_server_request_rejected',{trace_id:trace,parent_trace_id:parentTrace,flow_id:flowId,stage,checks});
     const response=serverJson(401,{error:'unauthorized',stage,trace_id:trace,parent_trace_id:parentTrace,checks},trace,parentTrace);
-    serverLog('github_mcp_server_request_completed',{trace_id:trace,parent_trace_id:parentTrace,status:401,stage,duration_ms:Date.now()-started});
+    serverLog('github_mcp_server_request_completed',{trace_id:trace,parent_trace_id:parentTrace,flow_id:flowId,status:401,stage,duration_ms:Date.now()-started});
     return response;
   }
-  serverLog('github_mcp_server_proxy_authenticated',{trace_id:trace,parent_trace_id:parentTrace,checks:[{name:'proxy_secret_matches',ok:true}]});
+  serverLog('github_mcp_server_proxy_authenticated',{trace_id:trace,parent_trace_id:parentTrace,flow_id:flowId,checks:[{name:'proxy_secret_matches',ok:true}]});
   try{
-    const response=await serverTraceContext.run({trace_id:trace,parent_trace_id:parentTrace},()=>mcpHandler(req));
-    serverLog(response.status>=400?'github_mcp_server_request_completed_with_error':'github_mcp_server_request_completed',{trace_id:trace,parent_trace_id:parentTrace,status:response.status,duration_ms:Date.now()-started,vercel_request_id:req.headers.get('x-vercel-id')||null});
+    const response=await serverTraceContext.run({trace_id:trace,parent_trace_id:parentTrace,flow_id:flowId},()=>mcpHandler(req));
+    serverLog(response.status>=400?'github_mcp_server_request_completed_with_error':'github_mcp_server_request_completed',{trace_id:trace,parent_trace_id:parentTrace,flow_id:flowId,status:response.status,duration_ms:Date.now()-started,vercel_request_id:req.headers.get('x-vercel-id')||null});
     return serverWithTrace(response,trace,parentTrace);
   }catch(e){
     const exception={name:e instanceof Error?e.name:'UnknownError',message:serverSafeText(e instanceof Error?e.message:e),...(e instanceof Error&&e.stack?{stack:serverSafeText(e.stack)}:{})};
-    serverLog('github_mcp_server_unhandled_exception',{trace_id:trace,parent_trace_id:parentTrace,stage:'mcp_handler_unhandled_exception',duration_ms:Date.now()-started,exception});
+    serverLog('github_mcp_server_unhandled_exception',{trace_id:trace,parent_trace_id:parentTrace,flow_id:flowId,stage:'mcp_handler_unhandled_exception',duration_ms:Date.now()-started,exception});
     return serverJson(500,{error:'internal_server_error',stage:'mcp_handler_unhandled_exception',trace_id:trace,parent_trace_id:parentTrace,exception},trace,parentTrace);
   }
 }
