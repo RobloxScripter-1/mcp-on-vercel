@@ -154,10 +154,188 @@ const gh=new URL('https://github.com/login/oauth/authorize');
 gh.searchParams.set('client_id',process.env.GITHUB_OAUTH_CLIENT_ID!);gh.searchParams.set('redirect_uri',GITHUB_CALLBACK);gh.searchParams.set('scope','read:user');gh.searchParams.set('state',githubState);gh.searchParams.set('allow_signup','false');
 logEvent('oauth_github_redirect_issued',{trace_id:traceFor(req),flow_id:authTraceId,state_fingerprint:stateFingerprint,callback_host:new URL(GITHUB_CALLBACK).host,callback_path:new URL(GITHUB_CALLBACK).pathname,github_authorization_host:gh.host,github_authorization_query_parameter_names:Array.from(gh.searchParams.keys()),redirect_status:302});
 return Response.redirect(gh.toString(),302)}
+
+function oauthDiagnosticResult(req:Request,record:any,stage:string,status:number,checks:any[],extra:Record<string,unknown>={}){
+  const trace=traceFor(req),flowId=typeof record?.trace_id==='string'?record.trace_id:null;
+  const failed=checks.filter((c:any)=>c.ok===false).map((c:any)=>c.name);
+  const payload=diagnosticSanitize({
+    diagnostic_mode:true,
+    ok:status<400&&failed.length===0,
+    stage,
+    trace_id:trace,
+    flow_id:flowId,
+    request:requestInfo(req),
+    checks,
+    failed_checks:failed,
+    ...extra
+  });
+  logEvent(status>=400?'oauth_github_diagnostic_failed':'oauth_github_diagnostic_completed',{
+    trace_id:trace,flow_id:flowId,stage,http_status:status,failed_checks:failed,
+    callback_query_parameter_names:Array.from(new URL(req.url).searchParams.keys())
+  });
+  return json(payload,status);
+}
+async function oauthDiagnosticStart(req:Request){
+  if(!ready())return debug('oauth_environment_incomplete',{checks:[{name:'required_environment_variables_present',ok:false,details:{missing:missing()}}]},503,req);
+  const diagnosticState='diag_'+randomBytes(32).toString('base64url');
+  const flowId=traceFor(req);
+  const record={kind:'github_oauth_diagnostic',state:diagnosticState,trace_id:flowId,created_at:new Date().toISOString()};
+  try{await put('mcp_oauth_diag_state:'+diagnosticState,record,TTL.state,req)}
+  catch(e){return debug('oauth_diagnostic_state_store_failed',{redis:redisDiagnostics(e),exception:exceptionInfo(e),checks:[{name:'required_environment_variables_present',ok:true},{name:'redis_store_diagnostic_state',ok:false}]},500,req)}
+  const gh=new URL('https://github.com/login/oauth/authorize');
+  gh.searchParams.set('client_id',process.env.GITHUB_OAUTH_CLIENT_ID!);
+  gh.searchParams.set('redirect_uri',GITHUB_CALLBACK);
+  gh.searchParams.set('scope','read:user');
+  gh.searchParams.set('state',diagnosticState);
+  gh.searchParams.set('allow_signup','false');
+  logEvent('oauth_github_diagnostic_redirect_issued',{
+    trace_id:traceFor(req),flow_id:flowId,
+    state_fingerprint:createHash('sha256').update(diagnosticState).digest('hex').slice(0,12),
+    callback_host:new URL(GITHUB_CALLBACK).host,callback_path:new URL(GITHUB_CALLBACK).pathname,
+    github_authorization_host:gh.host,
+    github_authorization_query_parameter_names:Array.from(gh.searchParams.keys()),
+    redirect_status:302
+  });
+  return Response.redirect(gh.toString(),302);
+}
+async function oauthDiagnosticCallback(req:Request,state:string){
+  const stateFingerprint=createHash('sha256').update(state).digest('hex').slice(0,12);
+  let observed:any;
+  try{observed=await takeDetailed('mcp_oauth_diag_state:'+state,req)}
+  catch(e){
+    const command=e instanceof RedisDiagnosticError?e.command:'UNKNOWN';
+    return oauthDiagnosticResult(req,null,command==='DEL'?'oauth_diagnostic_state_consume_failed':'oauth_diagnostic_state_lookup_failed',500,[
+      {name:'github_state_parameter_received',ok:true},
+      {name:'redis_diagnostic_state_lookup',ok:false}
+    ],{state_fingerprint:stateFingerprint,redis:redisDiagnostics(e),exception:exceptionInfo(e),diagnosis:'GitHub returned with a diagnostic state, but Redis could not validate or consume it.'});
+  }
+  if(!observed.observation.key_found)return oauthDiagnosticResult(req,null,'oauth_diagnostic_state_missing_or_expired',400,[
+    {name:'github_state_parameter_received',ok:true},
+    {name:'diagnostic_state_record_found',ok:false}
+  ],{state_fingerprint:stateFingerprint,redis_observation:observed.observation,state_ttl_seconds:TTL.state,diagnosis:'The diagnostic state was not present in Redis. It may have expired, been consumed already, or reached a different Redis configuration.'});
+  if(!observed.observation.json_parse_ok)return oauthDiagnosticResult(req,null,'oauth_diagnostic_state_record_corrupt',500,[
+    {name:'github_state_parameter_received',ok:true},
+    {name:'diagnostic_state_json_valid',ok:false}
+  ],{state_fingerprint:stateFingerprint,redis_observation:observed.observation});
+  const record=observed.value;
+  const recordValid=Boolean(record&&typeof record==='object'&&record.kind==='github_oauth_diagnostic'&&record.state===state&&typeof record.trace_id==='string');
+  if(!recordValid)return oauthDiagnosticResult(req,record,'oauth_diagnostic_state_record_invalid',500,[
+    {name:'github_state_parameter_received',ok:true},
+    {name:'diagnostic_state_record_schema_valid',ok:false},
+    {name:'diagnostic_state_matches_callback',ok:record?.state===state}
+  ],{state_fingerprint:stateFingerprint,redis_observation:observed.observation});
+  logEvent('oauth_github_diagnostic_state_consumed',{trace_id:traceFor(req),flow_id:record.trace_id,state_fingerprint:stateFingerprint,redis_observation:observed.observation});
+  const baseChecks=[
+    {name:'required_environment_variables_present',ok:ready()},
+    {name:'github_state_parameter_received',ok:true},
+    {name:'diagnostic_state_record_found_and_consumed',ok:true},
+    {name:'callback_host_matches_configured_host',ok:new URL(req.url).host===new URL(GITHUB_CALLBACK).host},
+    {name:'callback_path_matches_configured_path',ok:new URL(req.url).pathname===new URL(GITHUB_CALLBACK).pathname}
+  ];
+  const ghError=reqUrlParam(req,'error');
+  if(ghError){
+    const description=reqUrlParam(req,'error_description')||'';
+    baseChecks.push({name:'github_authorization_succeeded',ok:false});
+    return oauthDiagnosticResult(req,record,'oauth_diagnostic_github_authorization_denied',400,baseChecks,{
+      state_fingerprint:stateFingerprint,github_error:safeDiagnosticText(ghError),
+      github_error_description:safeDiagnosticText(description),
+      github_error_uri_present:Boolean(reqUrlParam(req,'error_uri')),
+      callback_query_parameter_names:Array.from(new URL(req.url).searchParams.keys()),
+      diagnosis:'GitHub returned an OAuth error instead of an authorization code. Inspect github_error and github_error_description.'
+    });
+  }
+  const code=reqUrlParam(req,'code');
+  baseChecks.push({name:'github_authorization_code_received',ok:Boolean(code)});
+  if(!code)return oauthDiagnosticResult(req,record,'oauth_diagnostic_github_code_missing',400,baseChecks,{
+    state_fingerprint:stateFingerprint,callback_query_parameter_names:Array.from(new URL(req.url).searchParams.keys()),
+    diagnosis:'GitHub returned the state but neither a code nor an OAuth error.'
+  });
+  let token:any;
+  let tokenStatus=0,tokenContentType='unknown',tokenBytes=0,tokenJsonOk=false;
+  try{
+    const r=await fetch('https://github.com/login/oauth/access_token',{
+      method:'POST',
+      headers:{Accept:'application/json','Content-Type':'application/x-www-form-urlencoded','User-Agent':'mcp-on-vercel'},
+      body:new URLSearchParams({client_id:process.env.GITHUB_OAUTH_CLIENT_ID!,client_secret:process.env.GITHUB_OAUTH_CLIENT_SECRET!,code,redirect_uri:GITHUB_CALLBACK}).toString(),
+      cache:'no-store'
+    });
+    tokenStatus=r.status;tokenContentType=r.headers.get('content-type')||'unknown';
+    const raw=await r.text();tokenBytes=raw.length;
+    try{token=JSON.parse(raw);tokenJsonOk=true}catch{token=null}
+    const tokenHttpOk=r.ok,tokenReceived=Boolean(token?.access_token);
+    const checks=[...baseChecks,
+      {name:'github_token_endpoint_http_success',ok:tokenHttpOk,http_status:tokenStatus},
+      {name:'github_token_response_json_valid',ok:tokenJsonOk},
+      {name:'github_access_token_received',ok:tokenReceived}
+    ];
+    if(!tokenHttpOk||!tokenReceived)return oauthDiagnosticResult(req,record,'oauth_diagnostic_github_token_exchange_failed',502,checks,{
+      state_fingerprint:stateFingerprint,github_status:tokenStatus,github_content_type:tokenContentType,github_response_bytes:tokenBytes,
+      github_error:typeof token?.error==='string'?safeDiagnosticText(token.error):'unknown',
+      github_error_description:typeof token?.error_description==='string'?safeDiagnosticText(token.error_description):undefined,
+      diagnosis:'GitHub callback succeeded, but the authorization code could not be exchanged for an access token. Check the OAuth app client ID/secret and callback URL configuration.'
+    });
+    logEvent('oauth_github_diagnostic_token_exchange_succeeded',{trace_id:traceFor(req),flow_id:record.trace_id,github_status:tokenStatus,github_content_type:tokenContentType,response_bytes:tokenBytes});
+  }catch(e){
+    return oauthDiagnosticResult(req,record,'oauth_diagnostic_github_token_exchange_network_error',502,[...baseChecks,{name:'github_token_exchange_request_completed',ok:false}],{
+      state_fingerprint:stateFingerprint,exception:exceptionInfo(e),
+      diagnosis:'The server could not complete the request to GitHub token exchange endpoint.'
+    });
+  }
+  let user:any,userStatus=0,userContentType='unknown',userBytes=0,userJsonOk=false;
+  try{
+    const r=await fetch('https://api.github.com/user',{
+      headers:{Authorization:'Bearer '+token.access_token,Accept:'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28','User-Agent':'mcp-on-vercel'},
+      cache:'no-store'
+    });
+    userStatus=r.status;userContentType=r.headers.get('content-type')||'unknown';
+    const raw=await r.text();userBytes=raw.length;
+    try{user=JSON.parse(raw);userJsonOk=true}catch{user=null}
+    const userHttpOk=r.ok,userLoginOk=typeof user?.login==='string'&&user.login.length>0;
+    const checks=[...baseChecks,
+      {name:'github_token_endpoint_http_success',ok:true,http_status:tokenStatus},
+      {name:'github_access_token_received',ok:true},
+      {name:'github_user_endpoint_http_success',ok:userHttpOk,http_status:userStatus},
+      {name:'github_user_response_json_valid',ok:userJsonOk},
+      {name:'github_login_received',ok:userLoginOk}
+    ];
+    if(!userHttpOk||!userLoginOk)return oauthDiagnosticResult(req,record,'oauth_diagnostic_github_user_lookup_failed',502,checks,{
+      state_fingerprint:stateFingerprint,github_status:userStatus,github_content_type:userContentType,github_response_bytes:userBytes,
+      github_message:typeof user?.message==='string'?safeDiagnosticText(user.message):undefined,
+      diagnosis:'GitHub accepted the OAuth code but the server could not retrieve the authenticated GitHub profile.'
+    });
+  }catch(e){
+    return oauthDiagnosticResult(req,record,'oauth_diagnostic_github_user_lookup_network_error',502,[...baseChecks,{name:'github_user_lookup_request_completed',ok:false}],{
+      state_fingerprint:stateFingerprint,exception:exceptionInfo(e),
+      diagnosis:'The server could not complete the GitHub user profile request.'
+    });
+  }
+  const allowlisted=(process.env.GITHUB_ALLOWED_LOGIN||'').trim().toLowerCase();
+  const loginMatches=String(user.login).toLowerCase()===allowlisted;
+  const finalChecks=[...baseChecks,
+    {name:'github_token_exchange_succeeded',ok:true,http_status:tokenStatus},
+    {name:'github_user_profile_loaded',ok:true,http_status:userStatus},
+    {name:'github_login_matches_GITHUB_ALLOWED_LOGIN',ok:loginMatches},
+  ];
+  logEvent('oauth_github_diagnostic_identity_checked',{trace_id:traceFor(req),flow_id:record.trace_id,github_login_matches_allowlist:loginMatches});
+  if(!loginMatches)return oauthDiagnosticResult(req,record,'oauth_diagnostic_github_account_not_allowed',403,finalChecks,{
+    state_fingerprint:stateFingerprint,authenticated_github_login:safeDiagnosticText(user.login),
+    allowlist_configured:Boolean(allowlisted),
+    diagnosis:'GitHub authentication worked, but the account returned by GitHub does not match GITHUB_ALLOWED_LOGIN.'
+  });
+  return oauthDiagnosticResult(req,record,'oauth_diagnostic_complete',200,finalChecks,{
+    state_fingerprint:stateFingerprint,authenticated_github_login:safeDiagnosticText(user.login),
+    github_token_exchange:{http_status:tokenStatus,content_type:tokenContentType,response_bytes:tokenBytes,json_valid:tokenJsonOk,access_token_received:true},
+    github_user_lookup:{http_status:userStatus,content_type:userContentType,response_bytes:userBytes,json_valid:userJsonOk,login_received:true},
+    diagnosis:'The GitHub OAuth redirect, callback state, authorization-code exchange, GitHub profile lookup, and allowed-account check all passed. If MCP connection still fails, the remaining problem is in client registration, redirect URI, PKCE, resource binding, token issuance, or MCP bearer authentication.'
+  });
+}
+function reqUrlParam(req:Request,key:string){return new URL(req.url).searchParams.get(key)||''}
+
 async function githubCallback(req:Request){
 if(!ready())return debug('oauth_environment_incomplete',{checks:[{name:'required_environment',ok:false,details:{missing:missing()}}]},503,req);
 const u=new URL(req.url),state=u.searchParams.get('state')||'';
 if(!state)return debug('oauth_state_parameter_missing',{checks:[{name:'github_state_parameter',ok:false,result:'missing'}],redis_lookup_attempted:false,callback_expected_host:new URL(GITHUB_CALLBACK).host,callback_expected_path:new URL(GITHUB_CALLBACK).pathname,callback_received_host:u.host,callback_received_path:u.pathname,callback_query_parameter_names:Array.from(u.searchParams.keys()),diagnosis:['The callback request reached the configured route without a state query parameter, so Redis was not queried.'],possible_causes:['The callback URL was opened directly','The browser/client navigated to the callback without GitHub returning code and state','An upstream redirect or client removed the callback query string']},400,req);
+if(state.startsWith('diag_'))return await oauthDiagnosticCallback(req,state);
 const stateFingerprint=createHash('sha256').update(state).digest('hex').slice(0,12);
 let observed:any;
 try{observed=await takeDetailed(`mcp_oauth_state:${state}`,req)}catch(e){const command=e instanceof RedisDiagnosticError?e.command:'UNKNOWN';return debug(command==='DEL'?'redis_state_consume_failed':'redis_state_lookup_failed',{state_parameter_present:true,state_length:state.length,state_fingerprint:stateFingerprint,redis_key_prefix:'mcp_oauth_state:',redis:redisDiagnostics(e),exception:e instanceof Error?{name:e.name,message:safeDiagnosticText(e.message)}:{message:'Unknown exception'},checks:[{name:'github_state_parameter',ok:true},{name:command==='DEL'?'redis_delete_state':'redis_get_state',ok:false}]},500,req)}
@@ -277,7 +455,7 @@ async function handler(req:Request){
     if(req.method==='OPTIONS')response=new Response(null,{status:204});
     else{
       const u=new URL(req.url),route=u.searchParams.get('route');
-      const aliases:Record<string,string>={'status':'/oauth/status','protected-resource':'/.well-known/oauth-protected-resource/mcp','authorization-server':'/.well-known/oauth-authorization-server','register':'/register','authorize':'/authorize','token':'/token','github-callback':'/oauth/github/callback'};
+      const aliases:Record<string,string>={'status':'/oauth/status','protected-resource':'/.well-known/oauth-protected-resource/mcp','authorization-server':'/.well-known/oauth-authorization-server','register':'/register','authorize':'/authorize','token':'/token','github-callback':'/oauth/github/callback','diagnose':'/oauth/diagnose'};
       const p=route?(aliases[route]||'/'+route):u.pathname;
       logEvent('oauth_route_resolved',{trace_id:id,request_path:u.pathname,route_alias_present:Boolean(route),resolved_route:p,method:req.method});
       if((p==='/status'||p==='/oauth/status')&&req.method==='GET'){
@@ -309,6 +487,7 @@ async function handler(req:Request){
       else if(p==='/register'){if(req.method==='POST')response=await register(req);else response=debug('registration_method_not_allowed',{allowed_method:'POST',checks:[{name:'http_method_allowed',ok:false,result:req.method}]},405,req)}
       else if(p==='/authorize'){if(req.method==='GET')response=await authorize(req);else response=debug('authorization_method_not_allowed',{allowed_method:'GET',checks:[{name:'http_method_allowed',ok:false,result:req.method}]},405,req)}
       else if(p==='/token'){if(req.method==='POST')response=await token(req);else response=debug('token_method_not_allowed',{allowed_method:'POST',checks:[{name:'http_method_allowed',ok:false,result:req.method}]},405,req)}
+      else if(p==='/oauth/diagnose'){if(req.method==='GET')response=await oauthDiagnosticStart(req);else response=debug('oauth_diagnostic_method_not_allowed',{allowed_method:'GET',checks:[{name:'http_method_allowed',ok:false,result:req.method}]},405,req)}
       else if(p==='/oauth/github/callback'){if(req.method==='GET')response=await githubCallback(req);else response=debug('github_callback_method_not_allowed',{allowed_method:'GET',checks:[{name:'http_method_allowed',ok:false,result:req.method}]},405,req)}
       else response=debug('route_not_found',{checks:[{name:'route_matched',ok:false}],requested_path:u.pathname,route_alias_present:Boolean(route),resolved_route:p},404,req);
     }
