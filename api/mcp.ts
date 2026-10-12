@@ -1,13 +1,10 @@
 import { createHash, randomBytes } from 'node:crypto';
+import { verifyOAuthClaims } from './oauth-crypto';
 
 const BASE_URL = (process.env.MCP_PUBLIC_BASE_URL || 'https://mcp-on-vercel-msaiful0404-5024s-projects.vercel.app').replace(/\/+$/, '');
 const RESOURCE = process.env.MCP_RESOURCE_URL || BASE_URL + '/mcp';
 const METADATA_URL = BASE_URL + '/.well-known/oauth-protected-resource/mcp';
 
-type Diagnostic = { kind:string; command:string; http_status:number; url_configured:boolean; token_configured:boolean; detail?:string; content_type?:string; response_bytes?:number };
-class StorageDiagnosticError extends Error {
-  constructor(readonly diagnostic:Diagnostic){super(diagnostic.kind)}
-}
 const traceId=()=>randomBytes(8).toString('hex');
 function safeText(value:unknown){
   let out=String(value??'unknown');
@@ -33,40 +30,10 @@ function challenge(trace:string,stage:string,checks:any[],details:Record<string,
   const payload={error:'invalid_token',stage,trace_id:trace,checks,...details,diagnosis:'Provide a valid OAuth access token issued by this server.'};
   return response(401,payload,trace,{'WWW-Authenticate':'Bearer resource_metadata="'+METADATA_URL+'", scope="github", error="invalid_token"'});
 }
-function storageDetails(e:unknown):Diagnostic{
-  if(e instanceof StorageDiagnosticError)return e.diagnostic;
-  const envError=e as any;
-  return {kind:typeof envError?.kind==='string'?envError.kind:'unknown_error',command:typeof envError?.command==='string'?envError.command:'GET',http_status:typeof envError?.status==='number'?envError.status:0,url_configured:Boolean(process.env.UPSTASH_REDIS_REST_URL),token_configured:Boolean(process.env.UPSTASH_REDIS_REST_TOKEN),...(envError?.message?{detail:safeText(envError.message)}:{})};
-}
-async function redisGet(key:string,trace:string):Promise<any|null>{
-  const url=process.env.UPSTASH_REDIS_REST_URL,token=process.env.UPSTASH_REDIS_REST_TOKEN;
-  if(!url&&!token)throw new StorageDiagnosticError({kind:'missing_url_and_token',command:'GET',http_status:0,url_configured:false,token_configured:false});
-  if(!url)throw new StorageDiagnosticError({kind:'missing_url',command:'GET',http_status:0,url_configured:false,token_configured:true});
-  if(!token)throw new StorageDiagnosticError({kind:'missing_token',command:'GET',http_status:0,url_configured:true,token_configured:false});
-  const started=Date.now();
-  try{
-    let r:Response;
-    try{r=await fetch(url,{method:'POST',headers:{Authorization:'Bearer '+token,'Content-Type':'application/json'},body:JSON.stringify(['GET',key]),cache:'no-store'});}
-    catch(e:any){throw new StorageDiagnosticError({kind:'network_error',command:'GET',http_status:0,url_configured:true,token_configured:true,detail:safeText(e?.name||'fetch_failed')});}
-    const contentType=r.headers.get('content-type')||'unknown';
-    let raw:string;
-    try{raw=await r.text();}catch(e:any){throw new StorageDiagnosticError({kind:'response_read_error',command:'GET',http_status:r.status,url_configured:true,token_configured:true,content_type:contentType,detail:safeText(e?.name||'body_read_failed')});}
-    let parsed:any;
-    try{parsed=JSON.parse(raw)}catch{throw new StorageDiagnosticError({kind:'non_json_response',command:'GET',http_status:r.status,url_configured:true,token_configured:true,content_type:contentType,response_bytes:raw.length});}
-    if(!parsed||typeof parsed!=='object'||Array.isArray(parsed))throw new StorageDiagnosticError({kind:'invalid_response_shape',command:'GET',http_status:r.status,url_configured:true,token_configured:true,content_type:contentType,response_bytes:raw.length});
-    if(parsed.error)throw new StorageDiagnosticError({kind:'redis_error',command:'GET',http_status:r.status,url_configured:true,token_configured:true,content_type:contentType,response_bytes:raw.length,detail:safeText(parsed.error)});
-    if(!r.ok)throw new StorageDiagnosticError({kind:'http_error',command:'GET',http_status:r.status,url_configured:true,token_configured:true,content_type:contentType,response_bytes:raw.length});
-    if(!Object.prototype.hasOwnProperty.call(parsed,'result'))throw new StorageDiagnosticError({kind:'missing_result',command:'GET',http_status:r.status,url_configured:true,token_configured:true,content_type:contentType,response_bytes:raw.length});
-    if(parsed.result===null){log('mcp_auth_redis_lookup_completed',{trace_id:trace,command:'GET',duration_ms:Date.now()-started,key_found:false});return null;}
-    if(typeof parsed.result!=='string')throw new StorageDiagnosticError({kind:'unexpected_get_result_type',command:'GET',http_status:r.status,url_configured:true,token_configured:true,content_type:contentType,detail:'Expected a string or null Redis GET result.'});
-    try{const value=JSON.parse(parsed.result);log('mcp_auth_redis_lookup_completed',{trace_id:trace,command:'GET',duration_ms:Date.now()-started,key_found:true,record_type:value===null?'null':Array.isArray(value)?'array':typeof value});return value;}
-    catch{throw new StorageDiagnosticError({kind:'invalid_json_result',command:'GET',http_status:r.status,url_configured:true,token_configured:true,content_type:contentType,detail:'Stored OAuth access-token record is not valid JSON.'});}
-  }catch(e){const diagnostic=storageDetails(e);log('mcp_auth_redis_lookup_failed',{trace_id:trace,duration_ms:Date.now()-started,redis:diagnostic});throw e;}
-}
 async function handler(request:Request):Promise<Response>{
   const trace=traceId(),started=Date.now(),info=requestInfo(request);
   const authHeader=request.headers.get('authorization')||'';
-  const match=/^Bearer\s+([A-Za-z0-9_-]{32,})$/i.exec(authHeader);
+  const match=/^Bearer\s+([A-Za-z0-9._-]{32,})$/i.exec(authHeader);
   const tokenFingerprint=match?createHash('sha256').update(match[1]).digest('hex').slice(0,12):null;
   log('mcp_auth_request_started',{trace_id:trace,request:info,bearer_header_present:Boolean(authHeader),bearer_format_valid:Boolean(match),token_fingerprint:tokenFingerprint});
   let res:Response;
@@ -77,24 +44,16 @@ async function handler(request:Request):Promise<Response>{
       log('mcp_auth_rejected',{trace_id:trace,stage:hasBearer?'mcp_bearer_format_invalid':'mcp_bearer_missing',checks:[{name:'authorization_header_present',ok:Boolean(authHeader)},{name:'bearer_scheme_present',ok:hasBearer},{name:'bearer_token_format_valid',ok:false}]});
       res=challenge(trace,hasBearer?'mcp_bearer_format_invalid':'mcp_bearer_missing',[{name:'authorization_header_present',ok:Boolean(authHeader)},{name:'bearer_token_format_valid',ok:false}]);
     }else{
-      const missing=['UPSTASH_REDIS_REST_URL','UPSTASH_REDIS_REST_TOKEN','PROXY_SECRET'].filter(k=>!process.env[k]);
+      const missing=['GITHUB_OAUTH_CLIENT_SECRET','GITHUB_ALLOWED_LOGIN','PROXY_SECRET'].filter(k=>!process.env[k]);
       if(missing.length){
         log('mcp_auth_configuration_failed',{trace_id:trace,stage:'mcp_auth_environment_incomplete',missing_environment:missing});
         res=response(503,{error:'server_not_configured',stage:'mcp_auth_environment_incomplete',trace_id:trace,missing_environment:missing,checks:[{name:'required_auth_environment',ok:false,missing}]},trace);
       }else{
-        let record:any;
-        try{record=await redisGet('mcp_access_token:'+match[1],trace)}
-        catch(e){
-          const redis=storageDetails(e);
-          log('mcp_auth_failed',{trace_id:trace,stage:'mcp_auth_redis_lookup_failed',redis,exception_name:e instanceof Error?e.name:'UnknownError'});
-          res=response(503,{error:'authentication_storage_unavailable',stage:'mcp_auth_redis_lookup_failed',trace_id:trace,redis,checks:[{name:'redis_access_token_lookup',ok:false,redis}]},trace);
-          log('mcp_auth_request_completed',{trace_id:trace,status:res.status,duration_ms:Date.now()-started,stage:'mcp_auth_redis_lookup_failed'});
-          return withTrace(res,trace);
-        }
+        const record=verifyOAuthClaims(match[1],'access_token');
         if(!record){
-          const checks=[{name:'access_token_record_found',ok:false},{name:'resource_matches',ok:false,result:'not_checked'},{name:'scope_is_github',ok:false,result:'not_checked'},{name:'login_matches_allowlist',ok:false,result:'not_checked'}];
-          log('mcp_auth_rejected',{trace_id:trace,flow_id:null,stage:'mcp_access_token_not_found_or_expired',token_fingerprint:tokenFingerprint,checks});
-          res=challenge(trace,'mcp_access_token_not_found_or_expired',checks,{token_fingerprint:tokenFingerprint});
+          const checks=[{name:'access_token_signature_valid',ok:false},{name:'access_token_not_expired',ok:false}];
+          log('mcp_auth_rejected',{trace_id:trace,flow_id:null,stage:'mcp_access_token_invalid_or_expired',token_fingerprint:tokenFingerprint,checks});
+          res=challenge(trace,'mcp_access_token_invalid_or_expired',checks,{token_fingerprint:tokenFingerprint});
         }else{
           const allowed=(process.env.GITHUB_ALLOWED_LOGIN||'').trim().toLowerCase();
           const resourceOk=record.resource===RESOURCE,scopeOk=record.scope==='github',loginTypeOk=typeof record.login==='string',loginOk=loginTypeOk&&record.login.toLowerCase()===allowed;
