@@ -81,23 +81,23 @@ async function githubRequest(path: string, init: RequestInit = {}) {
     });
   }catch(e){
     const exception={name:e instanceof Error?e.name:'UnknownError',message:serverSafeText(e instanceof Error?e.message:e)};
-    serverLog('github_api_request_failed',{trace_id:trace,parent_trace_id:parentTrace,stage:'github_api_network_error',method,endpoint_path:endpoint.pathname,duration_ms:Date.now()-started,exception});
+    serverLog('github_api_request_failed',{trace_id:trace,parent_trace_id:parentTrace,flow_id:flowId,stage:'github_api_network_error',method,endpoint_path:endpoint.pathname,duration_ms:Date.now()-started,exception});
     throw new Error('GitHub API network request failed for '+method+' '+endpoint.pathname+'.');
   }
   let text:string;
   try{text=await res.text()}catch(e){
     const exception={name:e instanceof Error?e.name:'UnknownError',message:serverSafeText(e instanceof Error?e.message:e)};
-    serverLog('github_api_request_failed',{trace_id:trace,parent_trace_id:parentTrace,stage:'github_api_response_read_failed',method,endpoint_path:endpoint.pathname,status:res.status,duration_ms:Date.now()-started,exception});
+    serverLog('github_api_request_failed',{trace_id:trace,parent_trace_id:parentTrace,flow_id:flowId,stage:'github_api_response_read_failed',method,endpoint_path:endpoint.pathname,status:res.status,duration_ms:Date.now()-started,exception});
     throw new Error('GitHub API response could not be read for '+method+' '+endpoint.pathname+' (HTTP '+res.status+').');
   }
   let data:unknown;
   try{data=JSON.parse(text)}catch{data=text}
   const message=typeof (data as any)?.message==='string'?serverSafeText((data as any).message):'No GitHub error message was returned.';
   if(!res.ok){
-    serverLog('github_api_request_failed',{trace_id:trace,parent_trace_id:parentTrace,stage:'github_api_http_error',method,endpoint_path:endpoint.pathname,status:res.status,status_text:res.statusText,content_type:res.headers.get('content-type')||null,response_bytes:text.length,duration_ms:Date.now()-started,github_message:message,checks:[{name:'github_api_http_success',ok:false,status:res.status}]});
+    serverLog('github_api_request_failed',{trace_id:trace,parent_trace_id:parentTrace,flow_id:flowId,stage:'github_api_http_error',method,endpoint_path:endpoint.pathname,status:res.status,status_text:res.statusText,content_type:res.headers.get('content-type')||null,response_bytes:text.length,duration_ms:Date.now()-started,github_message:message,checks:[{name:'github_api_http_success',ok:false,status:res.status}]});
     throw new Error('GitHub API request failed: '+method+' '+endpoint.pathname+' returned HTTP '+res.status+' ('+message+').');
   }
-  serverLog('github_api_request_succeeded',{trace_id:trace,parent_trace_id:parentTrace,method,endpoint_path:endpoint.pathname,status:res.status,content_type:res.headers.get('content-type')||null,response_bytes:text.length,duration_ms:Date.now()-started});
+  serverLog('github_api_request_succeeded',{trace_id:trace,parent_trace_id:parentTrace,flow_id:flowId,method,endpoint_path:endpoint.pathname,status:res.status,content_type:res.headers.get('content-type')||null,response_bytes:text.length,duration_ms:Date.now()-started});
   return data;
 }
 
