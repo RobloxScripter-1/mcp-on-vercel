@@ -56,7 +56,8 @@ async function handler(request:Request):Promise<Response>{
           res=challenge(trace,'mcp_access_token_invalid_or_expired',checks,{token_fingerprint:tokenFingerprint});
         }else{
           const allowed=(process.env.GITHUB_ALLOWED_LOGIN||'').trim().toLowerCase();
-          const resourceOk=record.resource===RESOURCE,scopeOk=record.scope==='github',loginTypeOk=typeof record.login==='string',loginOk=loginTypeOk&&record.login.toLowerCase()===allowed;
+          const login=typeof record.login==='string'?record.login:'';
+          const resourceOk=record.resource===RESOURCE,scopeOk=record.scope==='github',loginTypeOk=typeof record.login==='string',loginOk=loginTypeOk&&login.toLowerCase()===allowed;
           const checks=[{name:'access_token_record_found',ok:true},{name:'resource_matches',ok:resourceOk},{name:'scope_is_github',ok:scopeOk},{name:'login_field_is_string',ok:loginTypeOk},{name:'login_matches_allowlist',ok:loginOk}];
           const failed=checks.find(c=>!c.ok);
           if(failed){
