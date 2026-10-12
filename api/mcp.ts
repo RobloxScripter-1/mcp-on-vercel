@@ -108,7 +108,7 @@ async function handler(request:Request):Promise<Response>{
             log('mcp_auth_validated',{trace_id:trace,flow_id:typeof record.trace_id==='string'?record.trace_id:null,token_fingerprint:tokenFingerprint,checks});
             const upstream=new URL(BASE_URL+'/api/server');
             upstream.searchParams.set('key',process.env.PROXY_SECRET!);
-            const headers=new Headers(request.headers);headers.delete('host');headers.delete('authorization');
+            const headers=new Headers(request.headers);headers.delete('host');headers.delete('authorization');headers.set('x-mcp-parent-trace-id',trace);
             let upstreamResponse:Response;
             try{
               upstreamResponse=await fetch(upstream,{method:request.method,headers,body:request.method==='GET'||request.method==='HEAD'?undefined:await request.arrayBuffer(),redirect:'manual',cache:'no-store'});
