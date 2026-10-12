@@ -63,7 +63,7 @@ const withTraceHeader=(response:Response,id:string)=>{
   return new Response(response.body,{status:response.status,statusText:response.statusText,headers});
 };
 const html=(t:string,m:string,status=400)=>new Response('<!doctype html><meta name="viewport" content="width=device-width"><title>'+t+'</title><main style="font:16px system-ui;max-width:650px;margin:10vh auto;padding:24px"><h1>'+t+'</h1><p>'+m+'</p></main>',{status,headers:{'Content-Type':'text/html; charset=utf-8','Cache-Control':'no-store'}});
-class RedisDiagnosticErrorclass RedisDiagnosticError extends Error {
+class RedisDiagnosticError extends Error {
   constructor(readonly kind:string,readonly command:string,readonly status=0,readonly detail?:string,readonly contentType?:string,readonly responseBytes?:number){super(kind)}
 }
 function safeRedisDetail(value:unknown){
