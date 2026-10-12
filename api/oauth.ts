@@ -294,10 +294,11 @@ async function githubCallback(req:Request){
 if(!ready())return debug('oauth_environment_incomplete',{checks:[{name:'required_environment_variables_present',ok:false,details:{missing:missing()}}]},503,req);
 const u=new URL(req.url),state=u.searchParams.get('state')||'';
 if(!state)return debug('oauth_state_parameter_missing',{checks:[{name:'github_state_parameter',ok:false,result:'missing'}],redis_lookup_attempted:false,callback_expected_host:new URL(GITHUB_CALLBACK).host,callback_expected_path:new URL(GITHUB_CALLBACK).pathname,callback_received_host:u.host,callback_received_path:u.pathname,callback_query_parameter_names:Array.from(u.searchParams.keys()),diagnosis:['The callback request reached the configured route without a state query parameter.'],possible_causes:['The callback URL was opened directly','The browser/client navigated to the callback without GitHub returning code and state','An upstream redirect or client removed the callback query string']},400,req);
-const record=verifyOAuthClaims(state);
-if(!record)return debug('oauth_state_signature_invalid_or_expired',{state_fingerprint:createHash('sha256').update(state).digest('hex').slice(0,12),checks:[{name:'github_state_signature_valid',ok:false},{name:'github_state_expiry_valid',ok:false}],diagnosis:['The callback state could not be authenticated or has expired.']},400,req);
-if(record.typ==='github_diagnostic_state')return await oauthDiagnosticCallback(req,state,record);
-if(record.typ!=='github_authorization_state')return debug('oauth_state_type_invalid',{state_fingerprint:createHash('sha256').update(state).digest('hex').slice(0,12),checks:[{name:'github_state_signature_valid',ok:true},{name:'github_state_type_is_authorization',ok:false}],received_state_type:record.typ},400,req);
+const verifiedState=verifyOAuthClaims(state);
+if(!verifiedState)return debug('oauth_state_signature_invalid_or_expired',{state_fingerprint:createHash('sha256').update(state).digest('hex').slice(0,12),checks:[{name:'github_state_signature_valid',ok:false},{name:'github_state_expiry_valid',ok:false}],diagnosis:['The callback state could not be authenticated or has expired.']},400,req);
+if(verifiedState.typ==='github_diagnostic_state')return await oauthDiagnosticCallback(req,state,verifiedState);
+if(verifiedState.typ!=='github_authorization_state')return debug('oauth_state_type_invalid',{state_fingerprint:createHash('sha256').update(state).digest('hex').slice(0,12),checks:[{name:'github_state_signature_valid',ok:true},{name:'github_state_type_is_authorization',ok:false}],received_state_type:verifiedState.typ},400,req);
+const record=verifiedState as unknown as OAuthState & {typ:string;trace_id:string};
 const stateFingerprint=createHash('sha256').update(state).digest('hex').slice(0,12);
 const recordValid=typeof record.client_id==='string'&&typeof record.redirect_uri==='string'&&typeof record.state==='string'&&typeof record.challenge==='string'&&typeof record.resource==='string'&&typeof record.trace_id==='string';
 if(!recordValid)return debug('oauth_state_record_invalid',{state_fingerprint:stateFingerprint,checks:[{name:'state_record_schema_valid',ok:false}]},500,req);
