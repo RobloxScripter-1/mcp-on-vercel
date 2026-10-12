@@ -1,4 +1,5 @@
 import { createHash, randomBytes } from 'node:crypto';
+import { issueOAuthClaims, verifyOAuthClaims } from './oauth-crypto';
 
 const BASE_URL = (process.env.MCP_PUBLIC_BASE_URL || 'https://mcp-on-vercel-msaiful0404-5024s-projects.vercel.app').replace(/\/+$/, '');
 const RESOURCE = process.env.MCP_RESOURCE_URL || `${BASE_URL}/mcp`;
@@ -76,7 +77,7 @@ function redisDiagnostics(error:unknown){
   const e=error instanceof RedisDiagnosticError?error:null;
   return {kind:e?.kind||'unknown_error',command:e?.command||'UNKNOWN',http_status:e?.status||0,url_configured:Boolean(process.env.UPSTASH_REDIS_REST_URL),token_configured:Boolean(process.env.UPSTASH_REDIS_REST_TOKEN),...(e?.detail?{detail:e.detail}:{}),...(e?.contentType?{content_type:e.contentType}:{}),...(typeof e?.responseBytes==='number'?{response_bytes:e.responseBytes}:{})};
 }
-function missing(){return ['GITHUB_OAUTH_CLIENT_ID','GITHUB_OAUTH_CLIENT_SECRET','GITHUB_ALLOWED_LOGIN','GITHUB_PAT','PROXY_SECRET','UPSTASH_REDIS_REST_URL','UPSTASH_REDIS_REST_TOKEN'].filter(k=>!process.env[k])}
+function missing(){return ['GITHUB_OAUTH_CLIENT_ID','GITHUB_OAUTH_CLIENT_SECRET','GITHUB_ALLOWED_LOGIN','GITHUB_PAT','PROXY_SECRET'].filter(k=>!process.env[k])}
 function ready(){return missing().length===0}
 async function redis(cmd:any[],req?:Request){
   const started=Date.now();
@@ -105,22 +106,6 @@ async function redis(cmd:any[],req?:Request){
     throw e;
   }
 }
-async function put(k:string,v:any,ttl:number,req?:Request){await redis(['SET',k,JSON.stringify(v),'EX',ttl],req)}
-async function get(k:string,req?:Request){
-  const v=await redis(['GET',k],req);
-  if(v===null)return null;
-  if(typeof v!=='string')throw new RedisDiagnosticError('unexpected_get_result_type','GET',200,'Expected GET to return a string or null.');
-  try{return JSON.parse(v)}catch{throw new RedisDiagnosticError('invalid_json_result','GET',200,'Stored Redis value is not valid JSON.')}
-}
-async function takeDetailed(k:string,req?:Request){
- const raw=await redis(['GET',k],req);
- if(raw===null)return {value:null,observation:{key_found:false,redis_get_result_type:'null',json_parse_ok:null}};
- if(typeof raw!=='string')return {value:null,observation:{key_found:true,redis_get_result_type:typeof raw,json_parse_ok:false}};
- let value:any;try{value=JSON.parse(raw)}catch{return {value:null,observation:{key_found:true,redis_get_result_type:'string',json_parse_ok:false}}}
- const deleted=await redis(['DEL',k],req);
- if(deleted!==1)throw new RedisDiagnosticError('one_time_record_not_consumed','DEL',200,'Redis DEL did not confirm exclusive consumption of the one-time record.');
- return {value,observation:{key_found:true,redis_get_result_type:'string',json_parse_ok:true,parsed_value_type:value===null?'null':Array.isArray(value)?'array':typeof value,redis_del_attempted:true,redis_del_result_type:deleted===null?'null':typeof deleted,...(typeof deleted==='number'?{redis_del_count:deleted}:{})}};
-}
 async function body(req:Request){
   const contentType=(req.headers.get('content-type')||'').split(';')[0].trim().toLowerCase();
   if(contentType==='application/json')return await req.json() as any;
@@ -133,23 +118,22 @@ async function body(req:Request){
 }
 function redirectOk(v:any):v is string{if(typeof v!=='string'||v.length>2048)return false;try{const u=new URL(v);return u.protocol==='https:'&&!u.username&&!u.password&&!u.hash}catch{return false}}
 async function authorize(req:Request){
-if(!ready())return debug('oauth_environment_incomplete',{checks:[{name:'required_environment',ok:false,details:{missing:missing()}}]},503,req);
+if(!ready())return debug('oauth_environment_incomplete',{checks:[{name:'required_environment_variables_present',ok:false,details:{missing:missing()}}]},503,req);
 const u=new URL(req.url),clientId=u.searchParams.get('client_id')||'',redirect=u.searchParams.get('redirect_uri')||'',state=u.searchParams.get('state')||'',challenge=u.searchParams.get('code_challenge')||'',method=u.searchParams.get('code_challenge_method')||'',resource=u.searchParams.get('resource')||'';
-let client:any;
-try{client=await get(`mcp_oauth_client:${clientId}`,req)}catch(e){return debug('redis_client_lookup_failed',{client_id_present:Boolean(clientId),client_id_length:clientId.length,redis:redisDiagnostics(e),exception:exceptionInfo(e),checks:[{name:'redis_get_client',ok:false}]},500,req)}
-if(!client||!Array.isArray(client.redirect_uris))return debug('oauth_client_not_found',{client_id_present:Boolean(clientId),client_id_length:clientId.length,checks:[{name:'client_record_found',ok:false}],possible_causes:['The client was not registered','Client registration expired','The request reached a different deployment']},400,req);
+const client=verifyOAuthClaims(clientId,'oauth_client');
+if(!client||!Array.isArray(client.redirect_uris))return debug('oauth_client_not_found',{client_id_present:Boolean(clientId),client_id_length:clientId.length,checks:[{name:'client_id_signature_and_expiry_valid',ok:false}],possible_causes:['The client registration token is invalid or expired','The request reached a deployment using a different signing secret']},400,req);
 const redirectValid=redirectOk(redirect),redirectRegistered=client.redirect_uris.includes(redirect);
 if(!redirectValid||!redirectRegistered)return debug('oauth_redirect_uri_rejected',{checks:[{name:'redirect_uri_https_and_valid',ok:redirectValid},{name:'redirect_uri_matches_registration',ok:redirectRegistered}],redirect_uri_length:redirect.length,registered_redirect_uri_count:client.redirect_uris.length},400,req);
 if(u.searchParams.get('response_type')!=='code'||!state)return debug('oauth_authorization_request_invalid',{checks:[{name:'response_type_is_code',ok:u.searchParams.get('response_type')==='code'},{name:'state_parameter_present',ok:Boolean(state)}]},400,req);
 const pkceMethodOk=method==='S256',pkceChallengeOk=/^[A-Za-z0-9_-]{43,128}$/.test(challenge);
 if(!pkceMethodOk||!pkceChallengeOk)return debug('oauth_pkce_validation_failed',{checks:[{name:'pkce_method_is_s256',ok:pkceMethodOk,result:method||'missing'},{name:'pkce_challenge_format',ok:pkceChallengeOk,details:{present:Boolean(challenge),length:challenge.length}}]},400,req);
 if(resource!==RESOURCE)return debug('oauth_resource_mismatch',{checks:[{name:'resource_matches_server_configuration',ok:false}],resource_parameter_present:Boolean(resource),reconnect_required:true},400,req);
-const githubState=randomBytes(32).toString('base64url');
 const authTraceId=traceFor(req);
+let githubState:string;
+try{githubState=issueOAuthClaims({typ:'github_authorization_state',client_id:clientId,redirect_uri:redirect,state,challenge,resource,scope:'github',trace_id:authTraceId},TTL.state)}
+catch(e){return debug('oauth_state_signing_failed',{exception:exceptionInfo(e),checks:[{name:'oauth_state_signing_secret_available',ok:false}]},503,req)}
 const stateFingerprint=createHash('sha256').update(githubState).digest('hex').slice(0,12);
-const record:OAuthState={client_id:clientId,redirect_uri:redirect,state,challenge,resource,scope:'github',trace_id:authTraceId};
-try{await put(`mcp_oauth_state:${githubState}`,record,TTL.state,req)}catch(e){return debug('redis_state_store_failed',{state_fingerprint:createHash('sha256').update(githubState).digest('hex').slice(0,12),state_ttl_seconds:TTL.state,redis:redisDiagnostics(e),checks:[{name:'oauth_state_created',ok:true},{name:'redis_set_state',ok:false}]},500,req)}
-logEvent('oauth_state_stored',{trace_id:traceFor(req),flow_id:authTraceId,state_fingerprint:stateFingerprint,state_ttl_seconds:TTL.state});
+logEvent('oauth_state_signed',{trace_id:traceFor(req),flow_id:authTraceId,state_fingerprint:stateFingerprint,state_ttl_seconds:TTL.state});
 const gh=new URL('https://github.com/login/oauth/authorize');
 gh.searchParams.set('client_id',process.env.GITHUB_OAUTH_CLIENT_ID!);gh.searchParams.set('redirect_uri',GITHUB_CALLBACK);gh.searchParams.set('scope','read:user');gh.searchParams.set('state',githubState);gh.searchParams.set('allow_signup','false');
 logEvent('oauth_github_redirect_issued',{trace_id:traceFor(req),flow_id:authTraceId,state_fingerprint:stateFingerprint,callback_host:new URL(GITHUB_CALLBACK).host,callback_path:new URL(GITHUB_CALLBACK).pathname,github_authorization_host:gh.host,github_authorization_query_parameter_names:Array.from(gh.searchParams.keys()),redirect_status:302});
@@ -177,11 +161,10 @@ function oauthDiagnosticResult(req:Request,record:any,stage:string,status:number
 }
 async function oauthDiagnosticStart(req:Request){
   if(!ready())return debug('oauth_environment_incomplete',{checks:[{name:'required_environment_variables_present',ok:false,details:{missing:missing()}}]},503,req);
-  const diagnosticState='diag_'+randomBytes(32).toString('base64url');
   const flowId=traceFor(req);
-  const record={kind:'github_oauth_diagnostic',state:diagnosticState,trace_id:flowId,created_at:new Date().toISOString()};
-  try{await put('mcp_oauth_diag_state:'+diagnosticState,record,TTL.state,req)}
-  catch(e){return debug('oauth_diagnostic_state_store_failed',{redis:redisDiagnostics(e),exception:exceptionInfo(e),checks:[{name:'required_environment_variables_present',ok:true},{name:'redis_store_diagnostic_state',ok:false}]},500,req)}
+  let diagnosticState:string;
+  try{diagnosticState=issueOAuthClaims({typ:'github_diagnostic_state',nonce:randomBytes(24).toString('base64url'),trace_id:flowId},TTL.state)}
+  catch(e){return debug('oauth_diagnostic_state_signing_failed',{exception:exceptionInfo(e),checks:[{name:'oauth_state_signing_secret_available',ok:false}]},503,req)}
   const gh=new URL('https://github.com/login/oauth/authorize');
   gh.searchParams.set('client_id',process.env.GITHUB_OAUTH_CLIENT_ID!);
   gh.searchParams.set('redirect_uri',GITHUB_CALLBACK);
@@ -198,44 +181,19 @@ async function oauthDiagnosticStart(req:Request){
   });
   return Response.redirect(gh.toString(),302);
 }
-async function oauthDiagnosticCallback(req:Request,state:string){
+
+async function oauthDiagnosticCallback(req:Request,state:string,record:any){
   const stateFingerprint=createHash('sha256').update(state).digest('hex').slice(0,12);
-  let observed:any;
-  try{observed=await takeDetailed('mcp_oauth_diag_state:'+state,req)}
-  catch(e){
-    const command=e instanceof RedisDiagnosticError?e.command:'UNKNOWN';
-    return oauthDiagnosticResult(req,null,command==='DEL'?'oauth_diagnostic_state_consume_failed':'oauth_diagnostic_state_lookup_failed',500,[
-      {name:'github_state_parameter_received',ok:true},
-      {name:'redis_diagnostic_state_lookup',ok:false}
-    ],{state_fingerprint:stateFingerprint,redis:redisDiagnostics(e),exception:exceptionInfo(e),diagnosis:'GitHub returned with a diagnostic state, but Redis could not validate or consume it.'});
-  }
-  if(!observed.observation.key_found)return oauthDiagnosticResult(req,null,'oauth_diagnostic_state_missing_or_expired',400,[
-    {name:'github_state_parameter_received',ok:true},
-    {name:'diagnostic_state_record_found',ok:false}
-  ],{state_fingerprint:stateFingerprint,redis_observation:observed.observation,state_ttl_seconds:TTL.state,diagnosis:'The diagnostic state was not present in Redis. It may have expired, been consumed already, or reached a different Redis configuration.'});
-  if(!observed.observation.json_parse_ok)return oauthDiagnosticResult(req,null,'oauth_diagnostic_state_record_corrupt',500,[
-    {name:'github_state_parameter_received',ok:true},
-    {name:'diagnostic_state_json_valid',ok:false}
-  ],{state_fingerprint:stateFingerprint,redis_observation:observed.observation});
-  const record=observed.value;
-  const recordValid=Boolean(record&&typeof record==='object'&&record.kind==='github_oauth_diagnostic'&&record.state===state&&typeof record.trace_id==='string');
-  if(!recordValid)return oauthDiagnosticResult(req,record,'oauth_diagnostic_state_record_invalid',500,[
-    {name:'github_state_parameter_received',ok:true},
-    {name:'diagnostic_state_record_schema_valid',ok:false},
-    {name:'diagnostic_state_matches_callback',ok:record?.state===state}
-  ],{state_fingerprint:stateFingerprint,redis_observation:observed.observation});
-  logEvent('oauth_github_diagnostic_state_consumed',{trace_id:traceFor(req),flow_id:record.trace_id,state_fingerprint:stateFingerprint,redis_observation:observed.observation});
   const baseChecks=[
     {name:'required_environment_variables_present',ok:ready()},
-    {name:'github_state_parameter_received',ok:true},
-    {name:'diagnostic_state_record_found_and_consumed',ok:true},
+    {name:'github_state_signature_and_expiry_valid',ok:true},
     {name:'callback_host_matches_configured_host',ok:new URL(req.url).host===new URL(GITHUB_CALLBACK).host},
     {name:'callback_path_matches_configured_path',ok:new URL(req.url).pathname===new URL(GITHUB_CALLBACK).pathname}
   ];
   const ghError=reqUrlParam(req,'error');
   if(ghError){
     const description=reqUrlParam(req,'error_description')||'';
-    baseChecks.push({name:'github_authorization_succeeded',ok:false});
+    baseChecks.push({name:'github_authorization_succeeded',ok:false} as any);
     return oauthDiagnosticResult(req,record,'oauth_diagnostic_github_authorization_denied',400,baseChecks,{
       state_fingerprint:stateFingerprint,github_error:safeDiagnosticText(ghError),
       github_error_description:safeDiagnosticText(description),
@@ -245,7 +203,7 @@ async function oauthDiagnosticCallback(req:Request,state:string){
     });
   }
   const code=reqUrlParam(req,'code');
-  baseChecks.push({name:'github_authorization_code_received',ok:Boolean(code)});
+  baseChecks.push({name:'github_authorization_code_received',ok:Boolean(code)} as any);
   if(!code)return oauthDiagnosticResult(req,record,'oauth_diagnostic_github_code_missing',400,baseChecks,{
     state_fingerprint:stateFingerprint,callback_query_parameter_names:Array.from(new URL(req.url).searchParams.keys()),
     diagnosis:'GitHub returned the state but neither a code nor an OAuth error.'
@@ -329,121 +287,112 @@ async function oauthDiagnosticCallback(req:Request,state:string){
     diagnosis:'The GitHub OAuth redirect, callback state, authorization-code exchange, GitHub profile lookup, and allowed-account check all passed. If MCP connection still fails, the remaining problem is in client registration, redirect URI, PKCE, resource binding, token issuance, or MCP bearer authentication.'
   });
 }
+
 function reqUrlParam(req:Request,key:string){return new URL(req.url).searchParams.get(key)||''}
 
 async function githubCallback(req:Request){
-if(!ready())return debug('oauth_environment_incomplete',{checks:[{name:'required_environment',ok:false,details:{missing:missing()}}]},503,req);
+if(!ready())return debug('oauth_environment_incomplete',{checks:[{name:'required_environment_variables_present',ok:false,details:{missing:missing()}}]},503,req);
 const u=new URL(req.url),state=u.searchParams.get('state')||'';
-if(!state)return debug('oauth_state_parameter_missing',{checks:[{name:'github_state_parameter',ok:false,result:'missing'}],redis_lookup_attempted:false,callback_expected_host:new URL(GITHUB_CALLBACK).host,callback_expected_path:new URL(GITHUB_CALLBACK).pathname,callback_received_host:u.host,callback_received_path:u.pathname,callback_query_parameter_names:Array.from(u.searchParams.keys()),diagnosis:['The callback request reached the configured route without a state query parameter, so Redis was not queried.'],possible_causes:['The callback URL was opened directly','The browser/client navigated to the callback without GitHub returning code and state','An upstream redirect or client removed the callback query string']},400,req);
-if(state.startsWith('diag_'))return await oauthDiagnosticCallback(req,state);
+if(!state)return debug('oauth_state_parameter_missing',{checks:[{name:'github_state_parameter',ok:false,result:'missing'}],redis_lookup_attempted:false,callback_expected_host:new URL(GITHUB_CALLBACK).host,callback_expected_path:new URL(GITHUB_CALLBACK).pathname,callback_received_host:u.host,callback_received_path:u.pathname,callback_query_parameter_names:Array.from(u.searchParams.keys()),diagnosis:['The callback request reached the configured route without a state query parameter.'],possible_causes:['The callback URL was opened directly','The browser/client navigated to the callback without GitHub returning code and state','An upstream redirect or client removed the callback query string']},400,req);
+const record=verifyOAuthClaims(state);
+if(!record)return debug('oauth_state_signature_invalid_or_expired',{state_fingerprint:createHash('sha256').update(state).digest('hex').slice(0,12),checks:[{name:'github_state_signature_valid',ok:false},{name:'github_state_expiry_valid',ok:false}],diagnosis:['The callback state could not be authenticated or has expired.']},400,req);
+if(record.typ==='github_diagnostic_state')return await oauthDiagnosticCallback(req,state,record);
+if(record.typ!=='github_authorization_state')return debug('oauth_state_type_invalid',{state_fingerprint:createHash('sha256').update(state).digest('hex').slice(0,12),checks:[{name:'github_state_signature_valid',ok:true},{name:'github_state_type_is_authorization',ok:false}],received_state_type:record.typ},400,req);
 const stateFingerprint=createHash('sha256').update(state).digest('hex').slice(0,12);
-let observed:any;
-try{observed=await takeDetailed(`mcp_oauth_state:${state}`,req)}catch(e){const command=e instanceof RedisDiagnosticError?e.command:'UNKNOWN';return debug(command==='DEL'?'redis_state_consume_failed':'redis_state_lookup_failed',{state_parameter_present:true,state_length:state.length,state_fingerprint:stateFingerprint,redis_key_prefix:'mcp_oauth_state:',redis:redisDiagnostics(e),exception:e instanceof Error?{name:e.name,message:safeDiagnosticText(e.message)}:{message:'Unknown exception'},checks:[{name:'github_state_parameter',ok:true},{name:command==='DEL'?'redis_delete_state':'redis_get_state',ok:false}]},500,req)}
-if(!observed.observation.key_found)return debug('oauth_state_missing',{state_parameter_present:true,state_length:state.length,state_fingerprint:stateFingerprint,state_ttl_seconds:TTL.state,redis_key_prefix:'mcp_oauth_state:',redis_observation:observed.observation,checks:[{name:'github_state_parameter',ok:true},{name:'redis_get_state',ok:true,result:'GET returned null'},{name:'state_key_exists',ok:false,result:'not found'}],diagnosis:['Redis GET succeeded, but the state key does not exist. This is distinct from a Redis connection, authentication, or ACL failure.'],possible_causes:['The state key was never stored','The state expired after 600 seconds','The callback state differs from the state created by authorize','Another callback already consumed the one-time state']},400,req);
-if(!observed.observation.json_parse_ok)return debug('oauth_state_record_corrupt',{state_fingerprint:stateFingerprint,redis_observation:observed.observation,checks:[{name:'redis_get_state',ok:true},{name:'state_json_parse',ok:false}]},500,req);
-const record=observed.value as OAuthState|null;
-if(!record||typeof record!=='object'||typeof record.client_id!=='string'||typeof record.redirect_uri!=='string'||typeof record.state!=='string'||typeof record.challenge!=='string'||typeof record.resource!=='string')return debug('oauth_state_record_invalid',{state_fingerprint:stateFingerprint,redis_observation:observed.observation,checks:[{name:'state_record_schema',ok:false}]},500,req);
-logEvent('oauth_state_consumed',{trace_id:traceFor(req),flow_id:record.trace_id||null,state_fingerprint:stateFingerprint,redis_observation:observed.observation});
-if(u.searchParams.get('error')){const ghError=u.searchParams.get('error')||'unknown',ghDescription=u.searchParams.get('error_description')||'';logEvent('oauth_github_authorization_denied',{trace_id:traceFor(req),flow_id:record.trace_id||null,state_fingerprint:stateFingerprint,github_error:safeDiagnosticText(ghError),github_error_description:safeDiagnosticText(ghDescription),github_error_uri_present:Boolean(u.searchParams.get('error_uri')),callback_query_parameter_names:Array.from(u.searchParams.keys())});const d=new URL(record.redirect_uri);d.searchParams.set('error','access_denied');d.searchParams.set('state',record.state);return Response.redirect(d.toString(),302)}
+const recordValid=typeof record.client_id==='string'&&typeof record.redirect_uri==='string'&&typeof record.state==='string'&&typeof record.challenge==='string'&&typeof record.resource==='string'&&typeof record.trace_id==='string';
+if(!recordValid)return debug('oauth_state_record_invalid',{state_fingerprint:stateFingerprint,checks:[{name:'state_record_schema_valid',ok:false}]},500,req);
+logEvent('oauth_state_signature_validated',{trace_id:traceFor(req),flow_id:record.trace_id,state_fingerprint:stateFingerprint});
+if(u.searchParams.get('error')){const ghError=u.searchParams.get('error')||'unknown',ghDescription=u.searchParams.get('error_description')||'';logEvent('oauth_github_authorization_denied',{trace_id:traceFor(req),flow_id:record.trace_id,state_fingerprint:stateFingerprint,github_error:safeDiagnosticText(ghError),github_error_description:safeDiagnosticText(ghDescription),github_error_uri_present:Boolean(u.searchParams.get('error_uri')),callback_query_parameter_names:Array.from(u.searchParams.keys())});const d=new URL(record.redirect_uri);d.searchParams.set('error','access_denied');d.searchParams.set('state',record.state);return Response.redirect(d.toString(),302)}
 const code=u.searchParams.get('code');
-if(!code)return debug('github_code_missing',{flow_id:record.trace_id||null,state_fingerprint:stateFingerprint,github_error_parameter_present:Boolean(u.searchParams.get('error')),callback_query_parameter_names:Array.from(u.searchParams.keys()),checks:[{name:'github_state_validation',ok:true},{name:'github_code_parameter',ok:false}],diagnosis:['GitHub returned to the callback with a valid state, but supplied neither an authorization code nor an OAuth error.']},400,req);
+if(!code)return debug('github_code_missing',{flow_id:record.trace_id,state_fingerprint:stateFingerprint,github_error_parameter_present:Boolean(u.searchParams.get('error')),callback_query_parameter_names:Array.from(u.searchParams.keys()),checks:[{name:'github_state_signature_valid',ok:true},{name:'github_code_parameter',ok:false}],diagnosis:['GitHub returned a valid state, but supplied neither an authorization code nor an OAuth error.']},400,req);
 let token:any;
 try{
 const r=await fetch('https://github.com/login/oauth/access_token',{method:'POST',headers:{Accept:'application/json','Content-Type':'application/x-www-form-urlencoded','User-Agent':'mcp-on-vercel'},body:new URLSearchParams({client_id:process.env.GITHUB_OAUTH_CLIENT_ID!,client_secret:process.env.GITHUB_OAUTH_CLIENT_SECRET!,code,redirect_uri:GITHUB_CALLBACK}).toString(),cache:'no-store'});
 const raw=await r.text();let parsed:any=null;let parseOk=false;try{parsed=JSON.parse(raw);parseOk=true}catch{}token=parsed||{};
-if(!r.ok||!token.access_token)return debug('github_token_exchange_rejected',{state_fingerprint:stateFingerprint,checks:[{name:'github_token_endpoint_http_status',ok:r.ok,result:String(r.status)},{name:'github_response_json_parse',ok:parseOk},{name:'github_access_token_returned',ok:Boolean(token.access_token)}],github_status:r.status,content_type:r.headers.get('content-type')||'unknown',response_bytes:raw.length,github_error:typeof token.error==='string'?safeDiagnosticText(token.error):'unknown',github_error_description:typeof token.error_description==='string'?safeDiagnosticText(token.error_description):undefined},502,req)
-logEvent('oauth_github_token_exchange_succeeded',{trace_id:traceFor(req),flow_id:record.trace_id||null,state_fingerprint:stateFingerprint,github_status:r.status,content_type:r.headers.get('content-type')||'unknown',response_bytes:raw.length,access_token_received:Boolean(token.access_token),token_type:typeof token.token_type==='string'?token.token_type:'not_returned'});
-}catch(e){return debug('github_token_exchange_network_error',{state_fingerprint:stateFingerprint,exception:e instanceof Error?{name:e.name,message:safeDiagnosticText(e.message)}:{message:'Unknown exception'},checks:[{name:'github_token_exchange_request',ok:false}]},502,req)}
+if(!r.ok||!token.access_token)return debug('github_token_exchange_rejected',{flow_id:record.trace_id,state_fingerprint:stateFingerprint,checks:[{name:'github_token_endpoint_http_status',ok:r.ok,result:String(r.status)},{name:'github_response_json_parse',ok:parseOk},{name:'github_access_token_returned',ok:Boolean(token.access_token)}],github_status:r.status,content_type:r.headers.get('content-type')||'unknown',response_bytes:raw.length,github_error:typeof token.error==='string'?safeDiagnosticText(token.error):'unknown',github_error_description:typeof token.error_description==='string'?safeDiagnosticText(token.error_description):undefined},502,req)
+logEvent('oauth_github_token_exchange_succeeded',{trace_id:traceFor(req),flow_id:record.trace_id,state_fingerprint:stateFingerprint,github_status:r.status,content_type:r.headers.get('content-type')||'unknown',response_bytes:raw.length,access_token_received:true});
+}catch(e){return debug('github_token_exchange_network_error',{flow_id:record.trace_id,state_fingerprint:stateFingerprint,exception:exceptionInfo(e),checks:[{name:'github_token_exchange_request',ok:false}]},502,req)}
 let user:any;
 try{
-const r=await fetch('https://api.github.com/user',{headers:{Authorization:`Bearer ${token.access_token}`,Accept:'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28','User-Agent':'mcp-on-vercel'},cache:'no-store'});
+const r=await fetch('https://api.github.com/user',{headers:{Authorization:'Bearer '+token.access_token,Accept:'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28','User-Agent':'mcp-on-vercel'},cache:'no-store'});
 const raw=await r.text();let parsed:any=null;let parseOk=false;try{parsed=JSON.parse(raw);parseOk=true}catch{}user=parsed;
-if(!r.ok||!user?.login)return debug('github_user_lookup_failed',{state_fingerprint:stateFingerprint,checks:[{name:'github_user_endpoint_http_status',ok:r.ok,result:String(r.status)},{name:'github_user_response_json_parse',ok:parseOk},{name:'github_login_returned',ok:Boolean(user?.login)}],github_status:r.status,content_type:r.headers.get('content-type')||'unknown',response_bytes:raw.length,github_message:typeof user?.message==='string'?safeDiagnosticText(user.message):undefined},502,req)
-logEvent('oauth_github_user_lookup_succeeded',{trace_id:traceFor(req),flow_id:record.trace_id||null,state_fingerprint:stateFingerprint,github_status:r.status,content_type:r.headers.get('content-type')||'unknown',response_bytes:raw.length,login_returned:Boolean(user?.login)});
-}catch(e){return debug('github_user_lookup_network_error',{state_fingerprint:stateFingerprint,exception:e instanceof Error?{name:e.name,message:safeDiagnosticText(e.message)}:{message:'Unknown exception'},checks:[{name:'github_user_lookup_request',ok:false}]},502,req)}
+if(!r.ok||!user?.login)return debug('github_user_lookup_failed',{flow_id:record.trace_id,state_fingerprint:stateFingerprint,checks:[{name:'github_user_endpoint_http_status',ok:r.ok,result:String(r.status)},{name:'github_user_response_json_parse',ok:parseOk},{name:'github_login_returned',ok:Boolean(user?.login)}],github_status:r.status,content_type:r.headers.get('content-type')||'unknown',response_bytes:raw.length,github_message:typeof user?.message==='string'?safeDiagnosticText(user.message):undefined},502,req)
+logEvent('oauth_github_user_lookup_succeeded',{trace_id:traceFor(req),flow_id:record.trace_id,state_fingerprint:stateFingerprint,github_status:r.status,content_type:r.headers.get('content-type')||'unknown',response_bytes:raw.length,login_returned:true});
+}catch(e){return debug('github_user_lookup_network_error',{flow_id:record.trace_id,state_fingerprint:stateFingerprint,exception:exceptionInfo(e),checks:[{name:'github_user_lookup_request',ok:false}]},502,req)}
 const allowed=(process.env.GITHUB_ALLOWED_LOGIN||'').trim().toLowerCase();
-if(user.login.toLowerCase()!==allowed)return debug('github_account_not_allowed',{state_fingerprint:stateFingerprint,checks:[{name:'github_login_allowlist_match',ok:false}],diagnosis:['GitHub authentication succeeded, but the returned login does not match the configured account allowlist.']},403,req);
-logEvent('oauth_github_account_allowed',{trace_id:traceFor(req),flow_id:record.trace_id||null,state_fingerprint:stateFingerprint,allowlist_match:true});
-const mcpCode=randomBytes(32).toString('base64url');
-try{await put(`mcp_oauth_code:${mcpCode}`,{...record,login:user.login},TTL.code,req)}catch(e){return debug('redis_authorization_code_store_failed',{state_fingerprint:stateFingerprint,code_ttl_seconds:TTL.code,redis:redisDiagnostics(e),checks:[{name:'github_authentication',ok:true},{name:'redis_set_authorization_code',ok:false}]},500,req)}
+if(user.login.toLowerCase()!==allowed)return debug('github_account_not_allowed',{flow_id:record.trace_id,state_fingerprint:stateFingerprint,checks:[{name:'github_login_allowlist_match',ok:false}]},403,req);
+const mcpCode=issueOAuthClaims({typ:'authorization_code',client_id:record.client_id,redirect_uri:record.redirect_uri,state:record.state,challenge:record.challenge,resource:record.resource,scope:record.scope||'github',login:user.login,trace_id:record.trace_id},TTL.code);
 const d=new URL(record.redirect_uri);d.searchParams.set('code',mcpCode);d.searchParams.set('state',record.state);
-logEvent('oauth_authorization_code_created',{trace_id:traceFor(req),flow_id:record.trace_id||null,state_fingerprint:stateFingerprint,authorization_code_ttl_seconds:TTL.code,github_login_allowlist_match:true});
+logEvent('oauth_authorization_code_issued',{trace_id:traceFor(req),flow_id:record.trace_id,state_fingerprint:stateFingerprint,authorization_code_ttl_seconds:TTL.code,github_login_allowlist_match:true});
 return Response.redirect(d.toString(),302)}
+
 async function register(req:Request){
-  if(!ready())return debug('oauth_environment_incomplete',{checks:[{name:'required_environment',ok:false,details:{missing:missing()}}],diagnosis:['One or more required server environment variables are missing.']},503,req);
+  if(!ready())return json({error:'server_not_configured',missing_environment:missing()},503);
   let b:any;
-  try{b=await body(req)}catch(e){return debug('oauth_registration_body_parse_failed',{exception:exceptionInfo(e),content_type:req.headers.get('content-type')||null,checks:[{name:'request_body_parse',ok:false}]},400,req)}
-  if(!b||typeof b!=='object'||Array.isArray(b))return debug('oauth_registration_body_invalid',{body_type:b===null?'null':Array.isArray(b)?'array':typeof b,checks:[{name:'request_body_is_object',ok:false}]},400,req);
-  const uris=b.redirect_uris;
-  if(!Array.isArray(uris)||uris.length===0)return debug('oauth_redirect_uris_missing',{checks:[{name:'redirect_uris_is_nonempty_array',ok:false}],redirect_uris_type:Array.isArray(uris)?'array':typeof uris,redirect_uri_count:Array.isArray(uris)?uris.length:0},400,req);
-  const redirectChecks=uris.map((v:any,i:number)=>({name:'redirect_uri_'+(i+1)+'_is_https_and_valid',ok:redirectOk(v),value_type:typeof v,length:typeof v==='string'?v.length:0}));
-  if(redirectChecks.some((c:any)=>!c.ok))return debug('oauth_redirect_uri_rejected',{checks:redirectChecks,redirect_uri_count:uris.length,diagnosis:['Every redirect URI must be a valid HTTPS URL without username, password, or fragment.']},400,req);
-  const id=randomBytes(32).toString('base64url');
-  try{await put('mcp_oauth_client:'+id,{client_id:id,redirect_uris:uris,client_name:String(b.client_name||'MCP Client').slice(0,120)},TTL.client,req)}
-  catch(e){return debug('redis_client_store_failed',{client_id_fingerprint:createHash('sha256').update(id).digest('hex').slice(0,12),redirect_uri_count:uris.length,redis:redisDiagnostics(e),exception:exceptionInfo(e),checks:[{name:'redirect_uris_valid',ok:true},{name:'redis_set_client',ok:false}]},500,req)}
-  logEvent('oauth_client_registered',{trace_id:traceFor(req),client_id_fingerprint:createHash('sha256').update(id).digest('hex').slice(0,12),redirect_uri_count:uris.length,client_ttl_seconds:TTL.client});
-  return json({client_id:id,redirect_uris:uris,grant_types:['authorization_code','refresh_token'],response_types:['code'],token_endpoint_auth_method:'none'},201)
+  try{b=await body(req)}catch(e){return err('invalid_client_metadata','The registration body could not be parsed.')}
+  const uris=b?.redirect_uris;
+  if(!Array.isArray(uris)||!uris.length||!uris.every(redirectOk))return err('invalid_client_metadata','redirect_uris must contain HTTPS callback URLs.');
+  if(uris.length>10||uris.reduce((sum:number,v:string)=>sum+v.length,0)>8192)return err('invalid_client_metadata','At most 10 redirect URIs with a combined length of 8192 characters are supported.');
+  const clientId=issueOAuthClaims({typ:'oauth_client',sub:randomBytes(24).toString('base64url'),redirect_uris:uris,client_name:String(b.client_name||'MCP Client').slice(0,120)},TTL.client);
+  logEvent('oauth_client_registered',{trace_id:traceFor(req),client_id_fingerprint:createHash('sha256').update(clientId).digest('hex').slice(0,12),redirect_uri_count:uris.length,client_ttl_seconds:TTL.client,storage:'signed_stateless'});
+  return json({client_id:clientId,redirect_uris:uris,grant_types:['authorization_code','refresh_token'],response_types:['code'],token_endpoint_auth_method:'none'},201)
 }
+
 async function token(req:Request){
-  if(!ready())return debug('oauth_environment_incomplete',{checks:[{name:'required_environment',ok:false,details:{missing:missing()}}],diagnosis:['One or more required server environment variables are missing.']},503,req);
+  if(!ready())return err('server_error','OAuth is not configured.',503,req);
   let b:any;
   try{b=await body(req)}catch(e){return debug('oauth_token_body_parse_failed',{exception:exceptionInfo(e),content_type:req.headers.get('content-type')||null,checks:[{name:'request_body_parse',ok:false}]},400,req)}
   if(!b||typeof b!=='object'||Array.isArray(b))return debug('oauth_token_body_invalid',{body_type:b===null?'null':Array.isArray(b)?'array':typeof b,checks:[{name:'request_body_is_object',ok:false}]},400,req);
   const id=typeof b.client_id==='string'?b.client_id:'';
   const grant=typeof b.grant_type==='string'?b.grant_type:'';
   const resource=typeof b.resource==='string'?b.resource:'';
-  const clientIdOk=id.length>0,resourceOk=resource===RESOURCE;
-  if(!clientIdOk||!resourceOk)return protocolFailure(req,'invalid_request','oauth_token_required_fields_invalid','client_id and the configured resource are required.',400,[{name:'client_id_present',ok:clientIdOk},{name:'resource_matches_server_configuration',ok:resourceOk}],{client_id_present:clientIdOk,resource_parameter_present:Boolean(resource),grant_type:grant||'missing',expected_resource_configured:Boolean(RESOURCE)});
-  let client:any;
-  try{client=await get('mcp_oauth_client:'+id,req)}catch(e){return debug('redis_client_lookup_failed',{grant_type:grant||'missing',client_id_fingerprint:createHash('sha256').update(id).digest('hex').slice(0,12),redis:redisDiagnostics(e),exception:exceptionInfo(e),checks:[{name:'redis_get_client',ok:false}]},500,req)}
-  if(!client||!Array.isArray(client.redirect_uris))return protocolFailure(req,'invalid_client','oauth_client_not_found','The client_id is unknown or its registration record is invalid.',401,[{name:'client_registration_found',ok:false}],{client_id_fingerprint:createHash('sha256').update(id).digest('hex').slice(0,12),grant_type:grant||'missing',possible_causes:['The client was not registered','The client record expired or was removed','The request reached a different Redis database or deployment']});
+  const client=verifyOAuthClaims(id,'oauth_client');
+  if(!id||!client||!Array.isArray(client.redirect_uris))return protocolFailure(req,'invalid_client','oauth_client_signature_invalid_or_expired','The client_id is invalid or expired.',401,[{name:'client_id_signature_and_expiry_valid',ok:false}],{grant_type:grant||'missing'});
+  if(resource!==RESOURCE)return protocolFailure(req,'invalid_request','oauth_token_resource_mismatch','The resource must match this MCP server.',400,[{name:'resource_matches_server_configuration',ok:false}],{grant_type:grant||'missing',resource_parameter_present:Boolean(resource)});
   if(grant==='authorization_code'){
     const code=typeof b.code==='string'?b.code:'';
     const redirect=typeof b.redirect_uri==='string'?b.redirect_uri:'';
     const verifier=typeof b.code_verifier==='string'?b.code_verifier:'';
-    if(!code)return protocolFailure(req,'invalid_request','oauth_authorization_code_missing','The code field is required for the authorization_code grant.',400,[{name:'authorization_code_present',ok:false},{name:'grant_type_is_authorization_code',ok:true}],{grant_type:grant,redirect_uri_present:Boolean(redirect),code_verifier_present:Boolean(verifier)});
+    if(!code)return protocolFailure(req,'invalid_request','oauth_authorization_code_missing','The code field is required for the authorization_code grant.',400,[{name:'authorization_code_present',ok:false}],{grant_type:grant});
     if(!redirect)return protocolFailure(req,'invalid_request','oauth_token_redirect_uri_missing','redirect_uri is required for the authorization_code grant.',400,[{name:'redirect_uri_present',ok:false}],{grant_type:grant});
     const redirectRegistered=client.redirect_uris.includes(redirect);
     if(!redirectRegistered)return protocolFailure(req,'invalid_grant','oauth_token_redirect_uri_mismatch','redirect_uri does not match the URI registered for this client.',400,[{name:'redirect_uri_matches_registered_client',ok:false}],{grant_type:grant,redirect_uri_length:redirect.length,registered_redirect_uri_count:client.redirect_uris.length});
     const verifierFormatOk=/^[A-Za-z0-9._~-]{43,128}$/.test(verifier);
     if(!verifierFormatOk)return protocolFailure(req,'invalid_grant','oauth_pkce_verifier_invalid','A valid PKCE code_verifier of 43 to 128 allowed characters is required.',400,[{name:'code_verifier_format',ok:false}],{grant_type:grant,code_verifier_present:Boolean(verifier),code_verifier_length:verifier.length});
-    let consumed:any;
-    try{consumed=await takeDetailed('mcp_oauth_code:'+code,req)}catch(e){const command=e instanceof RedisDiagnosticError?e.command:'UNKNOWN';return debug(command==='DEL'?'redis_authorization_code_consume_failed':'redis_authorization_code_lookup_failed',{grant_type:grant,redis:redisDiagnostics(e),exception:exceptionInfo(e),checks:[{name:command==='DEL'?'redis_delete_authorization_code':'redis_get_authorization_code',ok:false}]},500,req)}
-    if(!consumed.observation.key_found)return protocolFailure(req,'invalid_grant','oauth_authorization_code_missing_or_expired','The authorization code was not found or its two-minute lifetime expired.',400,[{name:'authorization_code_found_in_redis',ok:false}],{grant_type:grant,authorization_code_ttl_seconds:TTL.code,redis_observation:consumed.observation,possible_causes:['The code was already exchanged','The code expired','The client sent a different code','The callback redirected to a different deployment']});
-    if(!consumed.observation.json_parse_ok)return debug('oauth_authorization_code_record_corrupt',{redis_observation:consumed.observation,grant_type:grant,checks:[{name:'authorization_code_record_json_parse',ok:false}]},500,req);
-    const c=consumed.value;
-    if(!c||typeof c!=='object')return debug('oauth_authorization_code_record_invalid',{redis_observation:consumed.observation,grant_type:grant,checks:[{name:'authorization_code_record_schema',ok:false}]},500,req);
+    const c=verifyOAuthClaims(code,'authorization_code');
+    if(!c)return protocolFailure(req,'invalid_grant','oauth_authorization_code_signature_invalid_or_expired','The authorization code is invalid or expired.',400,[{name:'authorization_code_signature_and_expiry_valid',ok:false}],{grant_type:grant,authorization_code_ttl_seconds:TTL.code});
     const codeClientOk=c.client_id===id,codeRedirectOk=c.redirect_uri===redirect,codeResourceOk=c.resource===RESOURCE;
-    if(!codeClientOk||!codeRedirectOk||!codeResourceOk)return protocolFailure(req,'invalid_grant','oauth_authorization_code_binding_mismatch','The one-time authorization code does not match this client, redirect URI, or resource.',400,[{name:'authorization_code_client_matches',ok:codeClientOk},{name:'authorization_code_redirect_uri_matches',ok:codeRedirectOk},{name:'authorization_code_resource_matches',ok:codeResourceOk}],{grant_type:grant,flow_id:c.trace_id||null,redis_observation:consumed.observation});
-    const pkceMatch=createHash('sha256').update(verifier).digest('base64url')===c.challenge;
+    if(!codeClientOk||!codeRedirectOk||!codeResourceOk)return protocolFailure(req,'invalid_grant','oauth_authorization_code_binding_mismatch','The authorization code does not match this client, redirect URI, or resource.',400,[{name:'authorization_code_client_matches',ok:codeClientOk},{name:'authorization_code_redirect_uri_matches',ok:codeRedirectOk},{name:'authorization_code_resource_matches',ok:codeResourceOk}],{grant_type:grant,flow_id:c.trace_id||null});
+    const pkceMatch=typeof c.challenge==='string'&&createHash('sha256').update(verifier).digest('base64url')===c.challenge;
     if(!pkceMatch)return protocolFailure(req,'invalid_grant','oauth_pkce_verification_failed','The PKCE verifier does not match the S256 challenge sent during authorization.',400,[{name:'pkce_verifier_hash_matches_challenge',ok:false}],{grant_type:grant,flow_id:c.trace_id||null});
-    const access=randomBytes(32).toString('base64url'),refresh=randomBytes(48).toString('base64url');
-    const rec={client_id:id,login:c.login,scope:'github',resource:RESOURCE,trace_id:c.trace_id||null};
-    try{await put('mcp_access_token:'+access,rec,TTL.access,req)}catch(e){return debug('redis_access_token_store_failed',{grant_type:grant,flow_id:c.trace_id||null,redis:redisDiagnostics(e),exception:exceptionInfo(e),checks:[{name:'pkce_verification',ok:true},{name:'redis_set_access_token',ok:false}]},500,req)}
-    try{await put('mcp_refresh_token:'+refresh,rec,TTL.refresh,req)}catch(e){try{await redis(['DEL','mcp_access_token:'+access],req)}catch{}return debug('redis_refresh_token_store_failed',{grant_type:grant,flow_id:c.trace_id||null,redis:redisDiagnostics(e),exception:exceptionInfo(e),checks:[{name:'access_token_stored',ok:true},{name:'redis_set_refresh_token',ok:false}]},500,req)}
-    logEvent('oauth_token_pair_issued',{trace_id:traceFor(req),flow_id:c.trace_id||null,grant_type:grant,scope:'github',access_token_ttl_seconds:TTL.access,refresh_token_ttl_seconds:TTL.refresh,login_allowlist_match:true});
+    const allowed=(process.env.GITHUB_ALLOWED_LOGIN||'').trim().toLowerCase();
+    const loginOk=typeof c.login==='string'&&c.login.toLowerCase()===allowed;
+    if(!loginOk)return protocolFailure(req,'invalid_grant','oauth_authorization_code_login_not_allowed','The authorization code login does not match the configured allowlist.',400,[{name:'github_login_matches_allowlist',ok:false}],{grant_type:grant,flow_id:c.trace_id||null});
+    const common={client_id:id,login:c.login,scope:'github',resource:RESOURCE,trace_id:typeof c.trace_id==='string'?c.trace_id:null};
+    const access=issueOAuthClaims({typ:'access_token',...common},TTL.access);
+    const refresh=issueOAuthClaims({typ:'refresh_token',...common},TTL.refresh);
+    logEvent('oauth_token_pair_issued',{trace_id:traceFor(req),flow_id:c.trace_id||null,grant_type:grant,scope:'github',access_token_ttl_seconds:TTL.access,refresh_token_ttl_seconds:TTL.refresh,login_allowlist_match:true,storage:'signed_stateless'});
     return json({access_token:access,token_type:'Bearer',expires_in:TTL.access,refresh_token:refresh,scope:'github',resource:RESOURCE})
   }
   if(grant==='refresh_token'){
     const oldToken=typeof b.refresh_token==='string'?b.refresh_token:'';
     if(!oldToken)return protocolFailure(req,'invalid_request','oauth_refresh_token_missing','The refresh_token field is required for the refresh_token grant.',400,[{name:'refresh_token_present',ok:false}],{grant_type:grant});
-    let consumed:any;
-    try{consumed=await takeDetailed('mcp_refresh_token:'+oldToken,req)}catch(e){const command=e instanceof RedisDiagnosticError?e.command:'UNKNOWN';return debug(command==='DEL'?'redis_refresh_token_consume_failed':'redis_refresh_token_lookup_failed',{grant_type:grant,redis:redisDiagnostics(e),exception:exceptionInfo(e),checks:[{name:command==='DEL'?'redis_delete_refresh_token':'redis_get_refresh_token',ok:false}]},500,req)}
-    if(!consumed.observation.key_found)return protocolFailure(req,'invalid_grant','oauth_refresh_token_missing_or_expired','The refresh token was not found or its 30-day lifetime expired.',400,[{name:'refresh_token_found_in_redis',ok:false}],{grant_type:grant,refresh_token_ttl_seconds:TTL.refresh,redis_observation:consumed.observation});
-    if(!consumed.observation.json_parse_ok)return debug('oauth_refresh_token_record_corrupt',{grant_type:grant,redis_observation:consumed.observation,checks:[{name:'refresh_token_record_json_parse',ok:false}]},500,req);
-    const old=consumed.value;
-    if(!old||typeof old!=='object')return debug('oauth_refresh_token_record_invalid',{grant_type:grant,checks:[{name:'refresh_token_record_schema',ok:false}]},500,req);
+    const old=verifyOAuthClaims(oldToken,'refresh_token');
+    if(!old)return protocolFailure(req,'invalid_grant','oauth_refresh_token_signature_invalid_or_expired','The refresh token is invalid or expired.',400,[{name:'refresh_token_signature_and_expiry_valid',ok:false}],{grant_type:grant,refresh_token_ttl_seconds:TTL.refresh});
     const clientOk=old.client_id===id,resourceMatch=old.resource===RESOURCE;
     if(!clientOk||!resourceMatch)return protocolFailure(req,'invalid_grant','oauth_refresh_token_binding_mismatch','The refresh token is not valid for this client or configured resource.',400,[{name:'refresh_token_client_matches',ok:clientOk},{name:'refresh_token_resource_matches',ok:resourceMatch}],{grant_type:grant,flow_id:old.trace_id||null});
-    const access=randomBytes(32).toString('base64url'),refresh=randomBytes(48).toString('base64url');
-    const rec={...old,trace_id:old.trace_id||null};
-    try{await put('mcp_access_token:'+access,rec,TTL.access,req)}catch(e){return debug('redis_access_token_store_failed',{grant_type:grant,flow_id:old.trace_id||null,redis:redisDiagnostics(e),exception:exceptionInfo(e),checks:[{name:'refresh_token_validated',ok:true},{name:'redis_set_access_token',ok:false}]},500,req)}
-    try{await put('mcp_refresh_token:'+refresh,rec,TTL.refresh,req)}catch(e){try{await redis(['DEL','mcp_access_token:'+access],req)}catch{}return debug('redis_refresh_token_store_failed',{grant_type:grant,flow_id:old.trace_id||null,redis:redisDiagnostics(e),exception:exceptionInfo(e),checks:[{name:'access_token_stored',ok:true},{name:'redis_set_refresh_token',ok:false}]},500,req)}
-    logEvent('oauth_token_pair_refreshed',{trace_id:traceFor(req),flow_id:old.trace_id||null,grant_type:grant,scope:old.scope||'github',access_token_ttl_seconds:TTL.access,refresh_token_ttl_seconds:TTL.refresh});
+    const allowed=(process.env.GITHUB_ALLOWED_LOGIN||'').trim().toLowerCase();
+    const loginOk=typeof old.login==='string'&&old.login.toLowerCase()===allowed;
+    if(!loginOk)return protocolFailure(req,'invalid_grant','oauth_refresh_token_login_not_allowed','The refresh token identity does not match the configured allowlist.',400,[{name:'github_login_matches_allowlist',ok:false}],{grant_type:grant,flow_id:old.trace_id||null});
+    const common={client_id:id,login:old.login,scope:'github',resource:RESOURCE,trace_id:typeof old.trace_id==='string'?old.trace_id:null};
+    const access=issueOAuthClaims({typ:'access_token',...common},TTL.access);
+    const refresh=issueOAuthClaims({typ:'refresh_token',...common},TTL.refresh);
+    logEvent('oauth_token_pair_refreshed',{trace_id:traceFor(req),flow_id:old.trace_id||null,grant_type:grant,scope:'github',access_token_ttl_seconds:TTL.access,refresh_token_ttl_seconds:TTL.refresh,storage:'signed_stateless'});
     return json({access_token:access,token_type:'Bearer',expires_in:TTL.access,refresh_token:refresh,scope:old.scope||'github',resource:RESOURCE})
   }
   return protocolFailure(req,'unsupported_grant_type','oauth_grant_type_unsupported','Use authorization_code or refresh_token.',400,[{name:'grant_type_supported',ok:false,result:grant||'missing'}],{grant_type:grant||'missing',supported_grant_types:['authorization_code','refresh_token']});
 }
+
 async function handler(req:Request){
   const id=traceId();
   traceByRequest.set(req,id);
@@ -476,8 +425,9 @@ async function handler(req:Request){
           status.redis.checked=true;
           try{const reply=await redis(['PING'],req);status.redis.ok=reply==='PONG';status.redis.reply_type=typeof reply;status.redis.reply=reply==='PONG'?'PONG':'unexpected_reply';checks.push({name:'upstash_redis_ping',ok:reply==='PONG',reply_type:typeof reply});}
           catch(e){status.redis.ok=false;status.redis.diagnostics=redisDiagnostics(e);checks.push({name:'upstash_redis_ping',ok:false,diagnostics:redisDiagnostics(e)});}
-        }else checks.push({name:'upstash_redis_ping',ok:false,result:'required Redis environment variables missing'});
-        status.failed_checks=checks.filter((c:any)=>!c.ok).map((c:any)=>c.name);
+        }else checks.push({name:'upstash_redis_ping',ok:true,required:false,result:'not required for stateless OAuth'});
+        for(const check of checks)if(check.name==='upstash_redis_ping')check.required=false;
+        status.failed_checks=checks.filter((c:any)=>c.required!==false&&!c.ok).map((c:any)=>c.name);
         status.healthy=status.failed_checks.length===0;
         logEvent('oauth_health_check_completed',{trace_id:id,healthy:status.healthy,failed_checks:status.failed_checks,redis_ok:status.redis.ok===true});
         response=json(status);
