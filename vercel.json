@@ -25,6 +25,10 @@
       "destination": "/api/oauth"
     },
     {
+      "source": "/oauth/diagnose",
+      "destination": "/api/oauth"
+    },
+    {
       "source": "/oauth/github/callback",
       "destination": "/api/oauth"
     },
