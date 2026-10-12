@@ -22,10 +22,32 @@
 
 import { createMcpHandler } from 'mcp-handler';
 import { z } from 'zod';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { randomBytes } from 'node:crypto';
 
 const GITHUB_PAT = process.env.GITHUB_PAT!;
 const PROXY_SECRET = process.env.PROXY_SECRET!;
 const GITHUB_API = 'https://api.github.com';
+
+type ServerTraceContext={trace_id:string;parent_trace_id:string|null};
+const serverTraceContext=new AsyncLocalStorage<ServerTraceContext>();
+const serverTraceId=()=>randomBytes(8).toString('hex');
+function serverSafeText(value:unknown){
+  let out=String(value??'unknown');
+  for(const secret of [process.env.GITHUB_PAT,process.env.PROXY_SECRET,process.env.GITHUB_OAUTH_CLIENT_SECRET,process.env.UPSTASH_REDIS_REST_TOKEN,process.env.UPSTASH_REDIS_REST_URL].filter((v):v is string=>Boolean(v)))out=out.split(secret).join('[redacted]');
+  return out.replace(/Bearer\s+\S+/gi,'Bearer [redacted]').replace(/\bgithub_pat_[A-Za-z0-9_]+\b/g,'[GitHub token redacted]').replace(/https?:\/\/\S+/gi,'[URL redacted]').slice(0,320);
+}
+function serverLog(event:string,data:Record<string,unknown>={}){
+  console.info(JSON.stringify({event,timestamp:new Date().toISOString(),...data}));
+}
+function serverJson(status:number,payload:unknown,trace:string,parentTrace:string|null){
+  return new Response(JSON.stringify(payload),{status,headers:{'Content-Type':'application/json','Cache-Control':'no-store','x-server-trace-id':trace,...(parentTrace?{'x-mcp-parent-trace-id':parentTrace}:{})}});
+}
+function serverWithTrace(response:Response,trace:string,parentTrace:string|null){
+  const headers=new Headers(response.headers);headers.set('Cache-Control','no-store');headers.set('x-server-trace-id',trace);if(parentTrace)headers.set('x-mcp-parent-trace-id',parentTrace);
+  return new Response(response.body,{status:response.status,statusText:response.statusText,headers});
+}
+
 
 function secretsMatch(a: string, b: string): boolean {
   if (a.length !== b.length) return false;
@@ -35,25 +57,46 @@ function secretsMatch(a: string, b: string): boolean {
 }
 
 async function githubRequest(path: string, init: RequestInit = {}) {
-  const res = await fetch(`${GITHUB_API}${path}`, {
-    ...init,
-    headers: {
-      Authorization: `Bearer ${GITHUB_PAT}`,
-      Accept: 'application/vnd.github+json',
-      'X-GitHub-Api-Version': '2022-11-28',
-      ...(init.headers as Record<string, string> | undefined),
-    },
-  });
-  const text = await res.text();
-  let data: unknown;
-  try {
-    data = JSON.parse(text);
-  } catch {
-    data = text;
+  const context=serverTraceContext.getStore();
+  const trace=context?.trace_id||'untracked';
+  const parentTrace=context?.parent_trace_id||null;
+  const method=String(init.method||'GET').toUpperCase();
+  const endpoint=new URL(path,GITHUB_API);
+  if(!GITHUB_PAT){
+    serverLog('github_api_request_failed',{trace_id:trace,parent_trace_id:parentTrace,stage:'github_pat_missing',method,endpoint_path:endpoint.pathname,checks:[{name:'github_pat_configured',ok:false}]});
+    throw new Error('GitHub API request blocked: GITHUB_PAT is not configured.');
   }
-  if (!res.ok) {
-    throw new Error(`GitHub API ${res.status}: ${JSON.stringify(data)}`);
+  const started=Date.now();
+  let res:Response;
+  try{
+    res=await fetch(endpoint.toString(),{
+      ...init,
+      headers:{
+        Authorization:'Bearer '+GITHUB_PAT,
+        Accept:'application/vnd.github+json',
+        'X-GitHub-Api-Version':'2022-11-28',
+        ...(init.headers as Record<string,string>|undefined),
+      },
+    });
+  }catch(e){
+    const exception={name:e instanceof Error?e.name:'UnknownError',message:serverSafeText(e instanceof Error?e.message:e)};
+    serverLog('github_api_request_failed',{trace_id:trace,parent_trace_id:parentTrace,stage:'github_api_network_error',method,endpoint_path:endpoint.pathname,duration_ms:Date.now()-started,exception});
+    throw new Error('GitHub API network request failed for '+method+' '+endpoint.pathname+'.');
   }
+  let text:string;
+  try{text=await res.text()}catch(e){
+    const exception={name:e instanceof Error?e.name:'UnknownError',message:serverSafeText(e instanceof Error?e.message:e)};
+    serverLog('github_api_request_failed',{trace_id:trace,parent_trace_id:parentTrace,stage:'github_api_response_read_failed',method,endpoint_path:endpoint.pathname,status:res.status,duration_ms:Date.now()-started,exception});
+    throw new Error('GitHub API response could not be read for '+method+' '+endpoint.pathname+' (HTTP '+res.status+').');
+  }
+  let data:unknown;
+  try{data=JSON.parse(text)}catch{data=text}
+  const message=typeof (data as any)?.message==='string'?serverSafeText((data as any).message):'No GitHub error message was returned.';
+  if(!res.ok){
+    serverLog('github_api_request_failed',{trace_id:trace,parent_trace_id:parentTrace,stage:'github_api_http_error',method,endpoint_path:endpoint.pathname,status:res.status,status_text:res.statusText,content_type:res.headers.get('content-type')||null,response_bytes:text.length,duration_ms:Date.now()-started,github_message:message,checks:[{name:'github_api_http_success',ok:false,status:res.status}]});
+    throw new Error('GitHub API request failed: '+method+' '+endpoint.pathname+' returned HTTP '+res.status+' ('+message+').');
+  }
+  serverLog('github_api_request_succeeded',{trace_id:trace,parent_trace_id:parentTrace,method,endpoint_path:endpoint.pathname,status:res.status,content_type:res.headers.get('content-type')||null,response_bytes:text.length,duration_ms:Date.now()-started});
   return data;
 }
 
@@ -399,14 +442,32 @@ const mcpHandler = createMcpHandler((server) => {
 // Wrap the MCP handler with the shared-secret check before it ever
 // reaches createMcpHandler's protocol logic.
 async function handler(req: Request): Promise<Response> {
-  const url = new URL(req.url);
-  const providedKey = url.searchParams.get('key');
-
-  if (!PROXY_SECRET || !providedKey || !secretsMatch(providedKey, PROXY_SECRET)) {
-    return new Response('Unauthorized', { status: 401 });
+  const trace=serverTraceId();
+  const parentRaw=req.headers.get('x-mcp-parent-trace-id');
+  const parentTrace=parentRaw&&/^[a-f0-9]{8,32}$/i.test(parentRaw)?parentRaw:null;
+  const started=Date.now();
+  const url=new URL(req.url),queryNames:string[]=[];
+  url.searchParams.forEach((_value,key)=>{if(!queryNames.includes(key))queryNames.push(key)});
+  const providedKey=url.searchParams.get('key');
+  serverLog('github_mcp_server_request_started',{trace_id:trace,parent_trace_id:parentTrace,method:req.method,path:url.pathname,query_parameter_names:queryNames,vercel_request_id:req.headers.get('x-vercel-id')||null,proxy_secret_configured:Boolean(PROXY_SECRET),proxy_key_present:Boolean(providedKey),proxy_key_length:providedKey?.length||0,github_pat_configured:Boolean(GITHUB_PAT)});
+  if(!PROXY_SECRET||!providedKey||!secretsMatch(providedKey,PROXY_SECRET)){
+    const stage=!PROXY_SECRET?'server_proxy_secret_missing':!providedKey?'server_proxy_key_missing':'server_proxy_key_mismatch';
+    const checks=[{name:'proxy_secret_configured',ok:Boolean(PROXY_SECRET)},{name:'proxy_key_parameter_present',ok:Boolean(providedKey)},{name:'proxy_key_matches_configured_secret',ok:Boolean(PROXY_SECRET&&providedKey&&secretsMatch(providedKey,PROXY_SECRET))}];
+    serverLog('github_mcp_server_request_rejected',{trace_id:trace,parent_trace_id:parentTrace,stage,checks});
+    const response=serverJson(401,{error:'unauthorized',stage,trace_id:trace,parent_trace_id:parentTrace,checks},trace,parentTrace);
+    serverLog('github_mcp_server_request_completed',{trace_id:trace,parent_trace_id:parentTrace,status:401,stage,duration_ms:Date.now()-started});
+    return response;
   }
-
-  return mcpHandler(req);
+  serverLog('github_mcp_server_proxy_authenticated',{trace_id:trace,parent_trace_id:parentTrace,checks:[{name:'proxy_secret_matches',ok:true}]});
+  try{
+    const response=await serverTraceContext.run({trace_id:trace,parent_trace_id:parentTrace},()=>mcpHandler(req));
+    serverLog(response.status>=400?'github_mcp_server_request_completed_with_error':'github_mcp_server_request_completed',{trace_id:trace,parent_trace_id:parentTrace,status:response.status,duration_ms:Date.now()-started,vercel_request_id:req.headers.get('x-vercel-id')||null});
+    return serverWithTrace(response,trace,parentTrace);
+  }catch(e){
+    const exception={name:e instanceof Error?e.name:'UnknownError',message:serverSafeText(e instanceof Error?e.message:e),...(e instanceof Error&&e.stack?{stack:serverSafeText(e.stack)}:{})};
+    serverLog('github_mcp_server_unhandled_exception',{trace_id:trace,parent_trace_id:parentTrace,stage:'mcp_handler_unhandled_exception',duration_ms:Date.now()-started,exception});
+    return serverJson(500,{error:'internal_server_error',stage:'mcp_handler_unhandled_exception',trace_id:trace,parent_trace_id:parentTrace,exception},trace,parentTrace);
+  }
 }
 
 export { handler as GET, handler as POST, handler as DELETE };
